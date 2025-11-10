@@ -1,5 +1,5 @@
 {
-  "name": "@noble/post-quantum",
+  "name": "@btc-vision/post-quantum",
   "version": "0.5.2",
   "description": "Auditable & minimal JS implementation of post-quantum cryptography: FIPS 203, 204, 205",
   "files": [
@@ -15,10 +15,10 @@
   },
   "devDependencies": {
     "@paulmillr/jsbt": "0.4.4",
-    "@types/node": "24.2.1",
-    "fast-check": "4.2.0",
+    "@types/node": "24.10.0",
+    "fast-check": "4.3.0",
     "prettier": "3.6.2",
-    "typescript": "5.9.2"
+    "typescript": "5.9.3"
   },
   "scripts": {
     "bench": "node test/benchmark.ts",
@@ -67,7 +67,7 @@
   "funding": "https://paulmillr.com/funding/",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/paulmillr/noble-post-quantum.git"
+    "url": "git+https://github.com/btc-vision/noble-post-quantum.git"
   },
   "type": "module",
   "main": "index.js",
