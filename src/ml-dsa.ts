@@ -189,7 +189,7 @@ function getDilithium(opts: DilithiumOpts) {
 
   const HighBits = (r: number) => decompose(r).r1;
   const LowBits = (r: number) => decompose(r).r0;
-  const MakeHint = (z: number, r: number) => {
+  /*const MakeHint = (z: number, r: number) => {
     // Compute hint bit indicating whether adding z to r alters the high bits of r.
 
     // From dilithium code
@@ -204,6 +204,12 @@ function getDilithium(opts: DilithiumOpts) {
     // See
     // https://github.com/GiacomoPope/dilithium-py?tab=readme-ov-file#optimising-decomposition-and-making-hints
     return res0;
+  };*/
+
+  const MakeHint = (z: number, r: number) => {
+    const r1 = HighBits(r);
+    const v1 = HighBits(r + z);
+    return +(r1 !== v1);
   };
 
   const UseHint = (h: number, r: number) => {
