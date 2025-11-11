@@ -107,18 +107,22 @@ const polyCoder = (d: number, compress: IdNum = id, verify: IdNum = id) =>
     decode: (i: number) => verify(compress(i)),
   });
 
+// Keep polyAdd and polySub mutating like the original
 const polyAdd = (a: Poly, b: Poly) => {
   for (let i = 0; i < a.length; i++) a[i] = mod(a[i] + b[i]);
   return a;
 };
-const polySub = (a: Poly, b: Poly): Poly => {
+
+const polySub = (a: Poly, b: Poly) => {
   for (let i = 0; i < a.length; i++) a[i] = mod(a[i] - b[i]);
   return a;
 };
 
+// FIX: Already non-mutating
 const polyShiftl = (p: Poly): Poly => {
-  for (let i = 0; i < N; i++) p[i] <<= D;
-  return p;
+  const result = p.slice();
+  for (let i = 0; i < N; i++) result[i] <<= D;
+  return result;
 };
 
 const polyChknorm = (p: Poly, B: number): boolean => {
@@ -189,7 +193,8 @@ function getDilithium(opts: DilithiumOpts) {
 
   const HighBits = (r: number) => decompose(r).r1;
   const LowBits = (r: number) => decompose(r).r0;
-  /*const MakeHint = (z: number, r: number) => {
+
+  const MakeHint = (z: number, r: number) => {
     // Compute hint bit indicating whether adding z to r alters the high bits of r.
 
     // From dilithium code
@@ -204,13 +209,13 @@ function getDilithium(opts: DilithiumOpts) {
     // See
     // https://github.com/GiacomoPope/dilithium-py?tab=readme-ov-file#optimising-decomposition-and-making-hints
     return res0;
-  };*/
+  }
 
-  const MakeHint = (z: number, r: number) => {
+  /*const MakeHint = (z: number, r: number) => {
     const r1 = HighBits(r);
     const v1 = HighBits(r + z);
     return +(r1 !== v1);
-  };
+  };*/
 
   const UseHint = (h: number, r: number) => {
     // Returns the high bits of r adjusted according to hint h
@@ -341,10 +346,14 @@ function getDilithium(opts: DilithiumOpts) {
     }
     return { r0: res0, r1: res1 };
   };
+
+  // FIX: Make polyUseHint non-mutating
   const polyUseHint = (u: Poly, h: Poly): Poly => {
-    for (let i = 0; i < N; i++) u[i] = UseHint(h[i], u[i]);
-    return u;
+    const result = u.slice() as Poly;
+    for (let i = 0; i < N; i++) result[i] = UseHint(h[i], result[i]);
+    return result;
   };
+
   const polyMakeHint = (a: Poly, b: Poly) => {
     const v = newPoly(N);
     let cnt = 0;
@@ -391,16 +400,16 @@ function getDilithium(opts: DilithiumOpts) {
       const t0 = [];
       const t1 = [];
       const xof = XOF128(rho);
-      const t = newPoly(N);
       for (let i = 0; i < K; i++) {
         // t ← NTT−1(A*NTT(s1)) + s2
-        cleanBytes(t); // don't-reallocate
+        let t = newPoly(N);
         for (let j = 0; j < L; j++) {
           const aij = RejNTTPoly(xof.get(j, i)); // super slow!
-          polyAdd(t, MultiplyNTTs(aij, s1Hat[j]));
+          t = polyAdd(t, MultiplyNTTs(aij, s1Hat[j])); // FIX: capture return value
         }
         NTT.decode(t);
-        const { r0, r1 } = polyPowerRound(polyAdd(t, s2[i])); // (t1, t0) ← Power2Round(t, d)
+        const tPlusS2 = polyAdd(t, s2[i]); // (t1, t0) ← Power2Round(t, d)
+        const { r0, r1 } = polyPowerRound(tPlusS2);
         t0.push(r0);
         t1.push(r1);
       }
@@ -412,28 +421,31 @@ function getDilithium(opts: DilithiumOpts) {
       // STATS
       // Kyber512:  { calls: 4, xofs: 12 }, Kyber768: { calls: 9, xofs: 27 }, Kyber1024: { calls: 16, xofs: 48 }
       // DSA44:    { calls: 24, xofs: 24 }, DSA65:    { calls: 41, xofs: 41 }, DSA87:    { calls: 71, xofs: 71 }
-      cleanBytes(rho, rhoPrime, K_, s1, s2, s1Hat, t, t0, t1, tr, seedDst);
+      cleanBytes(rho, rhoPrime, K_, s1, s2, s1Hat, t0, t1, tr, seedDst);
       return { publicKey, secretKey };
     },
     getPublicKey: (secretKey: Uint8Array) => {
-      const [rho, _K, _tr, s1, s2, _t0] = secretCoder.decode(secretKey); // (ρ, K,tr, s1, s2, t0) ← skDecode(sk)
+      const [rho_, _K_, _tr_, s1_, s2_, _t0_] = secretCoder.decode(secretKey); // (ρ, K,tr, s1, s2, t0) ← skDecode(sk)
+      // CRITICAL: Copy ALL decoded values to avoid ANY possibility of secretKey corruption
+      const rho = new Uint8Array(rho_);
+      const s1 = s1_.map((p) => p.slice() as Poly);
+      const s2 = s2_.map((p) => p.slice() as Poly);
       const xof = XOF128(rho);
       const s1Hat = s1.map((p) => NTT.encode(p.slice()));
       const t1: Poly[] = [];
-      const tmp = newPoly(N);
       for (let i = 0; i < K; i++) {
-        tmp.fill(0);
+        let tmp = newPoly(N);
         for (let j = 0; j < L; j++) {
           const aij = RejNTTPoly(xof.get(j, i)); // A_ij in NTT
-          polyAdd(tmp, MultiplyNTTs(aij, s1Hat[j])); // += A_ij * s1_j
+          tmp = polyAdd(tmp, MultiplyNTTs(aij, s1Hat[j])); // += A_ij * s1_j - FIX: capture return
         }
         NTT.decode(tmp); // NTT⁻¹
-        polyAdd(tmp, s2[i]); // t_i = A·s1 + s2
+        tmp = polyAdd(tmp, s2[i]); // t_i = A·s1 + s2 - FIX: capture return
         const { r1 } = polyPowerRound(tmp); // r1 = t1, r0 ≈ t0
         t1.push(r1);
       }
       xof.clean();
-      cleanBytes(tmp, s1Hat, _t0, s1, s2);
+      cleanBytes(s1Hat, s1, s2);
       return publicCoder.encode([rho, t1]);
     },
     // NOTE: random is optional.
@@ -453,11 +465,12 @@ function getDilithium(opts: DilithiumOpts) {
         A.push(pv);
       }
       xof.clean();
-      for (let i = 0; i < L; i++) NTT.encode(s1[i]); // sˆ1 ← NTT(s1)
+      for (let i = 0; i < L; i++) NTT.encode(s1[i]); // sˆ1 ← NTT(s1) - MUTATES s1
       for (let i = 0; i < K; i++) {
-        NTT.encode(s2[i]); // sˆ2 ← NTT(s2)
-        NTT.encode(t0[i]); // tˆ0 ← NTT(t0)
+        NTT.encode(s2[i]); // sˆ2 ← NTT(s2) - MUTATES s2
+        NTT.encode(t0[i]); // tˆ0 ← NTT(t0) - MUTATES t0
       }
+
       // This part is per msg
       const mu = externalMu
         ? msg
@@ -482,17 +495,33 @@ function getDilithium(opts: DilithiumOpts) {
       const x256 = XOF256(rhoprime, ZCoder.bytesLen);
       //  Rejection sampling loop
       main_loop: for (let kappa = 0; ; ) {
+        console.log(`[SIGN] Rejection sampling iteration, kappa=${kappa}`);
         const y = [];
         // y ← ExpandMask(ρ , κ)
         for (let i = 0; i < L; i++, kappa++)
           y.push(ZCoder.decode(x256.get(kappa & 0xff, kappa >> 8)()));
-        const z = y.map((i) => NTT.encode(i.slice()));
+        console.log(`[SIGN] Generated y, first element first 5: [${y[0]?.slice(0, 5).join(',')}]`);
+
+        const z = y.map((i) => {
+          const copy = i.slice() as Poly;
+          NTT.encode(copy);  // NTT.encode mutates in place
+          return copy;
+        });
+        console.log(`[SIGN] NTT encoded to z`);
+
         const w = [];
         for (let i = 0; i < K; i++) {
           // w ← NTT−1(A ◦ NTT(y))
           const wi = newPoly(N);
-          for (let j = 0; j < L; j++) polyAdd(wi, MultiplyNTTs(A[i][j], z[j]));
-          NTT.decode(wi);
+          console.log(`[SIGN] Computing w[${i}], wi initialized`);
+          for (let j = 0; j < L; j++) {
+            const product = MultiplyNTTs(A[i][j], z[j]);
+            console.log(`[SIGN] MultiplyNTTs A[${i}][${j}] * z[${j}], product first 3: [${product.slice(0, 3).join(',')}]`);
+            polyAdd(wi, product); // Mutating polyAdd
+            console.log(`[SIGN] After polyAdd, wi first 3: [${wi.slice(0, 3).join(',')}]`);
+          }
+          NTT.decode(wi);  // Decode in place since wi is already our working copy
+          console.log(`[SIGN] After NTT.decode, wi first 5: [${wi.slice(0, 5).join(',')}]`);
           w.push(wi);
         }
         const w1 = w.map((j) => j.map(HighBits)); // w1 ← HighBits(w)
@@ -502,15 +531,24 @@ function getDilithium(opts: DilithiumOpts) {
           .update(mu)
           .update(W1Vec.encode(w1))
           .digest();
-        // Verifer’s challenge
+        // Verifer's challenge
         const cHat = NTT.encode(SampleInBall(cTilde)); // c ← SampleInBall(c˜1); cˆ ← NTT(c)
         // ⟨⟨cs1⟩⟩ ← NTT−1(cˆ◦ sˆ1)
-        const cs1 = s1.map((i) => MultiplyNTTs(i, cHat));
+        const cs1 = s1.map((i, idx) => {
+          const product = MultiplyNTTs(i, cHat);
+          console.log(`[SIGN] cs1[${idx}] = MultiplyNTTs(s1[${idx}], cHat), product first 5: [${product.slice(0, 5).join(',')}]`);
+          return product;
+        });
         for (let i = 0; i < L; i++) {
-          polyAdd(NTT.decode(cs1[i]), y[i]); // z ← y + ⟨⟨cs1⟩⟩
-          if (polyChknorm(cs1[i], GAMMA1 - BETA)) continue main_loop; // ||z||∞ ≥ γ1 − β
+          console.log(`[SIGN] Before NTT.decode cs1[${i}] first 5: [${cs1[i].slice(0, 5).join(',')}]`);
+          polyAdd(NTT.decode(cs1[i]), y[i]); // z ← y + ⟨⟨cs1⟩⟩ - mutates cs1[i]
+          console.log(`[SIGN] After decode+add cs1[${i}] first 5: [${cs1[i].slice(0, 5).join(',')}]`);
+          if (polyChknorm(cs1[i], GAMMA1 - BETA)) {
+            console.log(`[SIGN] Failed polyChknorm for cs1[${i}], continuing main_loop`);
+            continue main_loop; // ||z||∞ ≥ γ1 − β
+          }
         }
-        // cs1 is now z (▷ Signer’s response)
+        // cs1 is now z (▷ Signer's response)
         let cnt = 0;
         const h = [];
         for (let i = 0; i < K; i++) {
@@ -520,14 +558,19 @@ function getDilithium(opts: DilithiumOpts) {
           const ct0 = NTT.decode(MultiplyNTTs(t0[i], cHat)); // ⟨⟨ct0⟩⟩ ← NTT−1(cˆ◦ tˆ0)
           if (polyChknorm(ct0, GAMMA2)) continue main_loop;
           polyAdd(r0, ct0);
-          // ▷ Signer’s hint
+          // ▷ Signer's hint
           const hint = polyMakeHint(r0, w1[i]); // h ← MakeHint(−⟨⟨ct0⟩⟩, w− ⟨⟨cs2⟩⟩ + ⟨⟨ct0⟩⟩)
           h.push(hint.v);
           cnt += hint.cnt;
         }
-        if (cnt > OMEGA) continue; // the number of 1’s in h is greater than ω
+        if (cnt > OMEGA) continue; // the number of 1's in h is greater than ω
         x256.clean();
+        console.log(`[SIGN] SUCCESS! Creating signature with:`);
+        console.log(`[SIGN]   cTilde length: ${cTilde.length}, first 8: ${Array.from(cTilde.slice(0, 8)).map(b => b.toString(16).padStart(2, '0')).join('')}`);
+        console.log(`[SIGN]   cs1 (z) length: ${cs1.length}, first element first 5: [${cs1[0]?.slice(0, 5).join(',')}]`);
+        console.log(`[SIGN]   h length: ${h.length}, first element first 5: [${h[0]?.slice(0, 5).join(',')}]`);
         const res = sigCoder.encode([cTilde, cs1, h]); // σ ← sigEncode(c˜, z mod±q, h)
+        console.log(`[SIGN] Signature encoded, length: ${res.length}, first 16: ${Array.from(res.slice(0, 16)).map(b => b.toString(16).padStart(2, '0')).join('')}`);
         // rho, _K, tr is subarray of secretKey, cannot clean.
         cleanBytes(cTilde, cs1, h, cHat, w1, w, z, y, rhoprime, mu, s1, s2, t0, ...A);
         return res;
@@ -544,34 +587,68 @@ function getDilithium(opts: DilithiumOpts) {
       validateInternalOpts(opts);
       const { externalMu = false } = opts;
       // ML-DSA.Verify(pk, M, σ): Verifes a signature σ for a message M.
-      const [rho, t1] = publicCoder.decode(publicKey); // (ρ, t1) ← pkDecode(pk)
+      const [rho_, t1_] = publicCoder.decode(publicKey); // (ρ, t1) ← pkDecode(pk)
+      // CRITICAL: Deep copy to avoid corrupting publicKey buffer
+      const rho = new Uint8Array(rho_);
+      const t1 = t1_.map((p) => new Int32Array(p));
       const tr = shake256(publicKey, { dkLen: TR_BYTES }); // 6: tr ← H(BytesToBits(pk), 512)
 
       if (sig.length !== sigCoder.bytesLen) return false; // return false instead of exception
-      const [cTilde, z, h] = sigCoder.decode(sig); // (c˜, z, h) ← sigDecode(σ), ▷ Signer’s commitment hash c ˜, response z and hint
-      if (h === false) return false; // if h = ⊥ then return false
+      const [cTilde_, z_, h_] = sigCoder.decode(sig); // (c˜, z, h) ← sigDecode(σ), ▷ Signer's commitment hash c ˜, response z and hint
+      if (h_ === false) return false; // if h = ⊥ then return false
+      // CRITICAL: Deep copy to avoid corrupting signature buffer
+      const cTilde = new Uint8Array(cTilde_);
+      const z = z_.map((p) => new Int32Array(p));
+      const h = h_.map((p) => new Int32Array(p));
+
       for (let i = 0; i < L; i++) if (polyChknorm(z[i], GAMMA1 - BETA)) return false;
       const mu = externalMu
         ? msg
         : shake256.create({ dkLen: CRH_BYTES }).update(tr).update(msg).digest(); // 7: µ ← H(tr||M, 512)
-      // Compute verifer’s challenge from c˜
-      const c = NTT.encode(SampleInBall(cTilde)); // c ← SampleInBall(c˜1)
-      const zNtt = z.map((i) => i.slice()); // zNtt = NTT(z)
-      for (let i = 0; i < L; i++) NTT.encode(zNtt[i]);
+      // Compute verifer's challenge from c˜
+      const c = NTT.encode(SampleInBall(cTilde).slice()); // c ← SampleInBall(c˜1) - FIX: copy before NTT
+      const zNtt = z.map((i) => {
+        const copy = i.slice() as Poly;
+        NTT.encode(copy);
+        return copy;
+      }); // zNtt = NTT(z)
       const wTick1 = [];
       const xof = XOF128(rho);
+      console.log(`[VERIFY] Starting wTick1 computation, K=${K}, L=${L}`);
       for (let i = 0; i < K; i++) {
-        const ct12d = MultiplyNTTs(NTT.encode(polyShiftl(t1[i])), c); //c * t1 * (2**d)
-        const Az = newPoly(N); // // A * z
+        console.log(`[VERIFY] Loop i=${i}`);
+        const shiftedT1 = polyShiftl(t1[i]);
+        console.log(`[VERIFY] t1[${i}] first 5: [${t1[i].slice(0, 5).join(',')}]`);
+        console.log(`[VERIFY] shiftedT1 first 5: [${shiftedT1.slice(0, 5).join(',')}]`);
+        const t1NTT = shiftedT1.slice() as Poly;
+        NTT.encode(t1NTT); // FIX: copy before NTT
+        console.log(`[VERIFY] After NTT.encode t1NTT first 5: [${t1NTT.slice(0, 5).join(',')}]`);
+        const ct12d = MultiplyNTTs(t1NTT, c); //c * t1 * (2**d)
+        console.log(`[VERIFY] ct12d first 5: [${ct12d.slice(0, 5).join(',')}]`);
+
+        let Az = newPoly(N); // A * z
         for (let j = 0; j < L; j++) {
           const aij = RejNTTPoly(xof.get(j, i)); // A[i][j] inplace
-          polyAdd(Az, MultiplyNTTs(aij, zNtt[j]));
+          const product = MultiplyNTTs(aij, zNtt[j]);
+          console.log(`[VERIFY] A[${i}][${j}] * zNtt[${j}] first 3: [${product.slice(0, 3).join(',')}]`);
+          Az = polyAdd(Az, product); // FIX: capture return
+          console.log(`[VERIFY] Az accumulated first 3: [${Az.slice(0, 3).join(',')}]`);
         }
+        console.log(`[VERIFY] Before NTT.decode Az first 5: [${Az.slice(0, 5).join(',')}]`);
+        const AzCopy = Az.slice() as Poly;  // FIX: Create copy before NTT.decode
+        NTT.decode(AzCopy);
+        console.log(`[VERIFY] After NTT.decode AzCopy first 5: [${AzCopy.slice(0, 5).join(',')}]`);
         // wApprox = A*z - c*t1 * (2**d)
-        const wApprox = NTT.decode(polySub(Az, ct12d));
-        // Reconstruction of signer’s commitment
-        wTick1.push(polyUseHint(wApprox, h[i])); // w ′ ← UseHint(h, w'approx )
+        // FIX: Decode ct12d before subtraction (was in NTT domain)
+        NTT.decode(ct12d);
+        const wApprox = polySub(AzCopy, ct12d);  // Use decoded copy
+        console.log(`[VERIFY] wApprox first 5: [${wApprox.slice(0, 5).join(',')}]`);
+        // Reconstruction of signer's commitment
+        const wTick1i = polyUseHint(wApprox, h[i]); // w ′ ← UseHint(h, w'approx )
+        console.log(`[VERIFY] wTick1[${i}] first 5: [${wTick1i.slice(0, 5).join(',')}]`);
+        wTick1.push(wTick1i);
       }
+
       xof.clean();
       // c˜′← H (µ||w1Encode(w′1), 2λ),  Hash it; this should match c˜
       const c2 = shake256
@@ -580,13 +657,14 @@ function getDilithium(opts: DilithiumOpts) {
         .update(W1Vec.encode(wTick1))
         .digest();
       // Additional checks in FIPS-204:
-      // [[ ||z||∞ < γ1 − β ]] and [[c ˜ = c˜′]] and [[number of 1’s in h is ≤ ω]]
+      // [[ ||z||∞ < γ1 − β ]] and [[c ˜ = c˜′]] and [[number of 1's in h is ≤ ω]]
       for (const t of h) {
         const sum = t.reduce((acc, i) => acc + i, 0);
         if (!(sum <= OMEGA)) return false;
       }
       for (const t of z) if (polyChknorm(t, GAMMA1 - BETA)) return false;
-      return equalBytes(cTilde, c2);
+      const match = equalBytes(cTilde, c2);
+      return match;
     },
   };
   return {

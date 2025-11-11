@@ -426,7 +426,11 @@ function gen(opts: SphincsOpts, hashOpts: SphincsHashOpts): SphincsSigner {
     sign: (msg: Uint8Array, sk: Uint8Array, opts: SigOpts = {}) => {
       validateSigOpts(opts);
       let { extraEntropy: random } = opts;
-      const [skSeed, skPRF, pk] = secretCoder.decode(sk); // todo: fix
+      const [skSeed_, skPRF_, pk_] = secretCoder.decode(sk);
+      // CRITICAL: Copy decoded values to avoid corrupting the secretKey if they're passed to cleanBytes
+      const skSeed = copyBytes(skSeed_);
+      const skPRF = copyBytes(skPRF_);
+      const pk = copyBytes(pk_);
       const [pkSeed, _] = publicCoder.decode(pk);
       // Set opt_rand to either PK.seed or to a random n-byte string
       if (random === false) random = copyBytes(pkSeed);
@@ -493,7 +497,7 @@ function gen(opts: SphincsOpts, hashOpts: SphincsHashOpts): SphincsSigner {
       }
       context.clean();
       const SIG = sigCoder.encode([R, fors, wots]);
-      cleanBytes(R, random, treeAddr, wotsAddr, forsLeaf, forsTreeAddr, indices, roots);
+      cleanBytes(R, random, treeAddr, wotsAddr, forsLeaf, forsTreeAddr, indices, roots, skSeed, skPRF, pk);
       return SIG;
     },
     verify: (sig: Uint8Array, msg: Uint8Array, publicKey: Uint8Array) => {
