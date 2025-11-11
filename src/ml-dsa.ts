@@ -189,38 +189,34 @@ function getDilithium(opts: DilithiumOpts) {
 
   const HighBits = (r: number) => decompose(r).r1;
   const LowBits = (r: number) => decompose(r).r0;
-  /*const MakeHint = (z: number, r: number) => {
-    // Compute hint bit indicating whether adding z to r alters the high bits of r.
 
-    // From dilithium code
-    const res0 = z <= GAMMA2 || z > Q - GAMMA2 || (z === Q - GAMMA2 && r === 0) ? 0 : 1;
-    // from FIPS204:
-    // // const r1 = HighBits(r);
-    // // const v1 = HighBits(r + z);
-    // // const res1 = +(r1 !== v1);
-    // But they return different results! However, decompose is same.
-    // So, either there is a bug in Dilithium ref implementation or in FIPS204.
-    // For now, lets use dilithium one, so test vectors can be passed.
-    // See
-    // https://github.com/GiacomoPope/dilithium-py?tab=readme-ov-file#optimising-decomposition-and-making-hints
-    return res0;
-  };*/
-
+  // FIPS-204 compatible MakeHint
   const MakeHint = (z: number, r: number) => {
     const r1 = HighBits(r);
     const v1 = HighBits(r + z);
     return +(r1 !== v1);
   };
 
+  // FIPS-204 compatible UseHint
   const UseHint = (h: number, r: number) => {
     // Returns the high bits of r adjusted according to hint h
-    const m = Math.floor((Q - 1) / (2 * GAMMA2));
+    const m = Math.floor((Q - 1) / (2 * GAMMA2)) | 0;
     const { r1, r0 } = decompose(r);
-    // 3: if h = 1 and r0 > 0 return (r1 + 1) mod m
-    // 4: if h = 1 and r0 ≤ 0 return (r1 − 1) mod m
-    if (h === 1) return r0 > 0 ? mod(r1 + 1, m) | 0 : mod(r1 - 1, m) | 0;
-    return r1 | 0;
+
+    if (h === 0) {
+      return r1 | 0;
+    }
+
+    // When h = 1, adjust based on the sign of r0
+    if (r0 > 0) {
+      // Increment and wrap
+      return (r1 === m - 1) ? 0 : (r1 + 1) | 0;
+    } else {
+      // Decrement and wrap
+      return (r1 === 0) ? (m - 1) : (r1 - 1) | 0;
+    }
   };
+
   const Power2Round = (r: number) => {
     // Decomposes r into (r1, r0) such that r ≡ r1*(2**d) + r0 mod q.
     const rPlus = mod(r);
@@ -345,11 +341,11 @@ function getDilithium(opts: DilithiumOpts) {
     for (let i = 0; i < N; i++) u[i] = UseHint(h[i], u[i]);
     return u;
   };
-  const polyMakeHint = (a: Poly, b: Poly) => {
+  const polyMakeHint = (z: Poly, r: Poly) => {
     const v = newPoly(N);
     let cnt = 0;
     for (let i = 0; i < N; i++) {
-      const h = MakeHint(a[i], b[i]);
+      const h = MakeHint(z[i], r[i]);
       v[i] = h;
       cnt += h;
     }
@@ -502,7 +498,7 @@ function getDilithium(opts: DilithiumOpts) {
           .update(mu)
           .update(W1Vec.encode(w1))
           .digest();
-        // Verifer’s challenge
+        // Verifer's challenge
         const cHat = NTT.encode(SampleInBall(cTilde)); // c ← SampleInBall(c˜1); cˆ ← NTT(c)
         // ⟨⟨cs1⟩⟩ ← NTT−1(cˆ◦ sˆ1)
         const cs1 = s1.map((i) => MultiplyNTTs(i, cHat));
@@ -510,22 +506,26 @@ function getDilithium(opts: DilithiumOpts) {
           polyAdd(NTT.decode(cs1[i]), y[i]); // z ← y + ⟨⟨cs1⟩⟩
           if (polyChknorm(cs1[i], GAMMA1 - BETA)) continue main_loop; // ||z||∞ ≥ γ1 − β
         }
-        // cs1 is now z (▷ Signer’s response)
+        // cs1 is now z (▷ Signer's response)
         let cnt = 0;
         const h = [];
         for (let i = 0; i < K; i++) {
           const cs2 = NTT.decode(MultiplyNTTs(s2[i], cHat)); // ⟨⟨cs2⟩⟩ ← NTT−1(cˆ◦ sˆ2)
-          const r0 = polySub(w[i], cs2).map(LowBits); // r0 ← LowBits(w − ⟨⟨cs2⟩⟩)
+          const wMinusCs2 = polySub(w[i].slice(), cs2); // w − ⟨⟨cs2⟩⟩
+          const r0 = wMinusCs2.map(LowBits); // r0 ← LowBits(w − ⟨⟨cs2⟩⟩)
           if (polyChknorm(r0, GAMMA2 - BETA)) continue main_loop; // ||r0||∞ ≥ γ2 − β
           const ct0 = NTT.decode(MultiplyNTTs(t0[i], cHat)); // ⟨⟨ct0⟩⟩ ← NTT−1(cˆ◦ tˆ0)
           if (polyChknorm(ct0, GAMMA2)) continue main_loop;
-          polyAdd(r0, ct0);
-          // ▷ Signer’s hint
-          const hint = polyMakeHint(r0, w1[i]); // h ← MakeHint(−⟨⟨ct0⟩⟩, w− ⟨⟨cs2⟩⟩ + ⟨⟨ct0⟩⟩)
+          // Compute ct0Neg = -ct0 by negating and then mod
+          const ct0Neg = ct0.map(x => mod(-x));
+          // Add ct0 to wMinusCs2: w − cs2 + ct0
+          const wMinusCs2PlusCt0 = polyAdd(wMinusCs2.slice(), ct0);
+          // ▷ Signer's hint - FIPS-204: h ← MakeHint(−⟨⟨ct0⟩⟩, w− ⟨⟨cs2⟩⟩ + ⟨⟨ct0⟩⟩)
+          const hint = polyMakeHint(ct0Neg, wMinusCs2PlusCt0);
           h.push(hint.v);
           cnt += hint.cnt;
         }
-        if (cnt > OMEGA) continue; // the number of 1’s in h is greater than ω
+        if (cnt > OMEGA) continue; // the number of 1's in h is greater than ω
         x256.clean();
         const res = sigCoder.encode([cTilde, cs1, h]); // σ ← sigEncode(c˜, z mod±q, h)
         // rho, _K, tr is subarray of secretKey, cannot clean.
@@ -548,13 +548,13 @@ function getDilithium(opts: DilithiumOpts) {
       const tr = shake256(publicKey, { dkLen: TR_BYTES }); // 6: tr ← H(BytesToBits(pk), 512)
 
       if (sig.length !== sigCoder.bytesLen) return false; // return false instead of exception
-      const [cTilde, z, h] = sigCoder.decode(sig); // (c˜, z, h) ← sigDecode(σ), ▷ Signer’s commitment hash c ˜, response z and hint
+      const [cTilde, z, h] = sigCoder.decode(sig); // (c˜, z, h) ← sigDecode(σ), ▷ Signer's commitment hash c ˜, response z and hint
       if (h === false) return false; // if h = ⊥ then return false
       for (let i = 0; i < L; i++) if (polyChknorm(z[i], GAMMA1 - BETA)) return false;
       const mu = externalMu
         ? msg
         : shake256.create({ dkLen: CRH_BYTES }).update(tr).update(msg).digest(); // 7: µ ← H(tr||M, 512)
-      // Compute verifer’s challenge from c˜
+      // Compute verifer's challenge from c˜
       const c = NTT.encode(SampleInBall(cTilde)); // c ← SampleInBall(c˜1)
       const zNtt = z.map((i) => i.slice()); // zNtt = NTT(z)
       for (let i = 0; i < L; i++) NTT.encode(zNtt[i]);
@@ -569,7 +569,7 @@ function getDilithium(opts: DilithiumOpts) {
         }
         // wApprox = A*z - c*t1 * (2**d)
         const wApprox = NTT.decode(polySub(Az, ct12d));
-        // Reconstruction of signer’s commitment
+        // Reconstruction of signer's commitment
         wTick1.push(polyUseHint(wApprox, h[i])); // w ′ ← UseHint(h, w'approx )
       }
       xof.clean();
@@ -580,7 +580,7 @@ function getDilithium(opts: DilithiumOpts) {
         .update(W1Vec.encode(wTick1))
         .digest();
       // Additional checks in FIPS-204:
-      // [[ ||z||∞ < γ1 − β ]] and [[c ˜ = c˜′]] and [[number of 1’s in h is ≤ ω]]
+      // [[ ||z||∞ < γ1 − β ]] and [[c ˜ = c˜′]] and [[number of 1's in h is ≤ ω]]
       for (const t of h) {
         const sum = t.reduce((acc, i) => acc + i, 0);
         if (!(sum <= OMEGA)) return false;
