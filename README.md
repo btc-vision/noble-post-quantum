@@ -8,8 +8,8 @@ Auditable & minimal JS implementation of post-quantum public-key cryptography.
 - 🦾 ML-KEM & CRYSTALS-Kyber: lattice-based KEM from FIPS-203
 - 🔋 ML-DSA & CRYSTALS-Dilithium: lattice-based signatures from FIPS-204
 - 🐈 SLH-DSA & SPHINCS+: hash-based Winternitz signatures from FIPS-205
-- 🍡 Hybrid algorithms, combining classic & post-quantum
-- 🪶 16KB (gzipped) for everything, including bundled noble-hashes & noble-curves
+- 🍡 Hybrid algorithms, combining classic & post-quantum: Concrete, XWing, KitchenSink
+- 🪶 16KB (gzipped) for everything, including bundled hashes & curves
 
 Take a glance at [GitHub Discussions](https://github.com/paulmillr/noble-post-quantum/discussions) for questions and support.
 
@@ -33,8 +33,8 @@ Take a glance at [GitHub Discussions](https://github.com/paulmillr/noble-post-qu
   [post-quantum](https://github.com/paulmillr/noble-post-quantum),
   5kb [secp256k1](https://github.com/paulmillr/noble-secp256k1) /
   [ed25519](https://github.com/paulmillr/noble-ed25519)
-- [Check out homepage](https://paulmillr.com/noble/)
-  for reading resources, documentation and apps built with noble
+- [Check out the homepage](https://paulmillr.com/noble/)
+  for reading resources, documentation, and apps built with noble
 
 ## Usage
 
@@ -67,16 +67,16 @@ import {
   slh_dsa_shake_256s,
 } from '@noble/post-quantum/slh-dsa.js';
 import {
-  XWing,
-  KitchenSinkMLKEM768X25519,
-  QSFMLKEM768P256, QSFMLKEM1024P384
-} from '@noble/post-quantum/hybrids.js';
+  ml_kem768_x25519, ml_kem768_p256, ml_kem1024_p384,
+  KitchenSink_ml_kem768_x25519, XWing,
+  QSF_ml_kem768_p256, QSF_ml_kem1024_p384,
+} from '@noble/post-quantum/hybrid.js';
 ```
 
 - [ML-KEM / Kyber](#ml-kem--kyber-shared-secrets)
 - [ML-DSA / Dilithium](#ml-dsa--dilithium-signatures)
 - [SLH-DSA / SPHINCS+](#slh-dsa--sphincs-signatures)
-- [Hybrids: XWing, KitchenSink and others](#hybrids-xwing-kitchensink-and-others)
+- [hybrid: XWing, KitchenSink and others](#hybrid-xwing-kitchensink-and-others)
 - [What should I use?](#what-should-i-use)
 - [Security](#security)
 - [Speed](#speed)
@@ -99,7 +99,7 @@ const malloryShared = ml_kem768.decapsulate(cipherText, malloryKeys.secretKey); 
 notDeepStrictEqual(aliceShared, malloryShared); // Different key!
 ```
 
-Lattice-based key encapsulation mechanism, defined in [FIPS-203](https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.203.pdf).
+Lattice-based key encapsulation mechanism, defined in [FIPS-203](https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.203.pdf) ([website](https://www.pq-crystals.org/kyber/resources.shtml), [repo](https://github.com/pq-crystals/kyber)).
 Can be used as follows:
 
 1. *Alice* generates secret & public keys, then sends publicKey to *Bob*
@@ -109,7 +109,6 @@ Can be used as follows:
   Now, both Alice and Bob have same sharedSecret key
   without exchanging in plainText: aliceShared == bobShared.
 
-See [website](https://www.pq-crystals.org/kyber/resources.shtml) and [repo](https://github.com/pq-crystals/kyber).
 There are some concerns with regards to security: see
 [djb blog](https://blog.cr.yp.to/20231003-countcorrectly.html) and
 [mailing list](https://groups.google.com/a/list.nist.gov/g/pqc-forum/c/W2VOzy0wz_E).
@@ -133,9 +132,8 @@ const sig = ml_dsa65.sign(msg, keys.secretKey);
 const isValid = ml_dsa65.verify(sig, msg, keys.publicKey);
 ```
 
-Lattice-based digital signature algorithm, defined in [FIPS-204](https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.204.pdf). See
-[website](https://www.pq-crystals.org/dilithium/index.shtml) and
-[repo](https://github.com/pq-crystals/dilithium).
+Lattice-based digital signature algorithm, defined in [FIPS-204](https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.204.pdf) ([website](https://www.pq-crystals.org/dilithium/index.shtml),
+[repo](https://github.com/pq-crystals/dilithium)).
 The internals are similar to ML-KEM, but keys and params are different.
 
 ### SLH-DSA / SPHINCS+ signatures
@@ -162,30 +160,39 @@ const sig2 = sph.sign(msg2, keys2.secretKey);
 const isValid2 = sph.verify(sig2, msg2, keys2.publicKey);
 ```
 
-Hash-based digital signature algorithm, defined in [FIPS-205](https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.205.pdf).
-See [website](https://sphincs.org) and [repo](https://github.com/sphincs/sphincsplus). We implement spec v3.1 with FIPS adjustments.
+Hash-based digital signature algorithm, defined in [FIPS-205](https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.205.pdf) ([website](https://sphincs.org), [repo](https://github.com/sphincs/sphincsplus)). We implement spec v3.1 with FIPS adjustments.
 
-There are many different kinds,
-but basically `sha2` / `shake` indicate internal hash, `128` / `192` / `256` indicate security level, and `s` /`f` indicate trade-off (Small / Fast).
+- sha2 vs shake (sha3): indicates internal hash function used
+- 128 / 192 / 256: indicates security level in bits
+- s / f: indicates small vs fast trade-off
+
 SLH-DSA is slow: see [benchmarks](#speed) for key size & speed.
 
-### Hybrids: XWing, KitchenSink and others
+### hybrid: XWing, KitchenSink and others
 
 ```js
 import {
-  XWing,
-  KitchenSinkMLKEM768X25519,
-  QSFMLKEM768P256, QSFMLKEM1024P384
-} from '@noble/post-quantum/hybrids.js';
+  ml_kem768_x25519, ml_kem768_p256, ml_kem1024_p384,
+  KitchenSink_ml_kem768_x25519, XWing,
+  QSF_ml_kem768_p256, QSF_ml_kem1024_p384,
+} from '@noble/post-quantum/hybrid.js';
 ```
 
-XWing is x25519+mlkem768, just like kitchensink.
+Hybrid submodule combine post-quantum algorithms with elliptic curve cryptography:
+
+- `ml_kem768_x25519`: ML-KEM-768 + X25519 (CG Framework, same as XWing)
+- `ml_kem768_p256`: ML-KEM-768 + P-256 (CG Framework)
+- `ml_kem1024_p384`: ML-KEM-1024 + P-384 (CG Framework)
+- `KitchenSink_ml_kem768_x25519`: ML-KEM-768 + X25519 with HKDF-SHA256 combiner
+- `QSF_ml_kem768_p256`: ML-KEM-768 + P-256 (QSF construction)
+- `QSF_ml_kem1024_p384`: ML-KEM-1024 + P-384 (QSF construction)
 
 The following spec drafts are matched:
 
-- [irtf-cfrg-hybrid-kems](https://datatracker.ietf.org/doc/draft-irtf-cfrg-hybrid-kems/)
-- [connolly-cfrg-xwing-kem](https://datatracker.ietf.org/doc/draft-connolly-cfrg-xwing-kem/)
-- [tls-westerbaan-xyber768d00](https://datatracker.ietf.org/doc/draft-tls-westerbaan-xyber768d00/)
+- [irtf-cfrg-hybrid-kems-07](https://datatracker.ietf.org/doc/draft-irtf-cfrg-hybrid-kems/)
+- [irtf-cfrg-concrete-hybrid-kems-02](https://datatracker.ietf.org/doc/draft-irtf-cfrg-concrete-hybrid-kems/)
+- [connolly-cfrg-xwing-kem-09](https://datatracker.ietf.org/doc/draft-connolly-cfrg-xwing-kem/)
+- [tls-westerbaan-xyber768d00-03](https://datatracker.ietf.org/doc/draft-tls-westerbaan-xyber768d00/)
 
 ### What should I use?
 
@@ -202,8 +209,8 @@ We suggest to use ECC + ML-KEM for key agreement, ECC + SLH-DSA for signatures.
 
 ML-KEM and ML-DSA are lattice-based. SLH-DSA is hash-based, which means it is built on top of older, more conservative primitives. NIST guidance for security levels:
 
-- Category 3 (~AES-192): ML-KEM-768, ML-DSA-65, SLH-DSA-[SHA2/shake]-192[s/f]
-- Category 5 (~AES-256): ML-KEM-1024, ML-DSA-87, SLH-DSA-[SHA2/shake]-256[s/f]
+- Category 3 (~AES-192): ML-KEM-768, ML-DSA-65, SLH-DSA-192
+- Category 5 (~AES-256): ML-KEM-1024, ML-DSA-87, SLH-DSA-256
 
 NIST recommends to use cat-3+, while australian [ASD only allows cat-5 after 2030](https://www.cyber.gov.au/resources-business-and-government/essential-cyber-security/ism/cyber-security-guidelines/guidelines-cryptography).
 
@@ -226,37 +233,34 @@ Keep in mind that even hardware versions ML-KEM [are vulnerable](https://eprint.
 
 ### Supply chain security
 
-- **Commits** are signed with PGP keys, to prevent forgery. Make sure to verify commit signatures
-- **Releases** are transparent and built on GitHub CI.
-  Check out [attested checksums of single-file builds](https://github.com/paulmillr/noble-post-quantum/attestations)
-  and [provenance logs](https://github.com/paulmillr/noble-post-quantum/actions/workflows/release.yml)
-- **Rare releasing** is followed to ensure less re-audit need for end-users
-- **Dependencies** are minimized and locked-down: any dependency could get hacked and users will be downloading malware with every install.
-  - We make sure to use as few dependencies as possible
-  - Automatic dep updates are prevented by locking-down version ranges; diffs are checked with `npm-diff`
-- **Dev Dependencies** are disabled for end-users; they are only used to develop / build the source code
+- **Commits** are signed with PGP keys to prevent forgery. Be sure to verify the commit signatures
+- **Releases** are made transparently through token-less GitHub CI and Trusted Publishing. Be sure to verify the [provenance logs](https://docs.npmjs.com/generating-provenance-statements) for authenticity.
+- **Rare releasing** is practiced to minimize the need for re-audits by end-users.
+- **Dependencies** are minimized and strictly pinned to reduce supply-chain risk.
+  - We use as few dependencies as possible.
+  - Version ranges are locked, and changes are checked with npm-diff.
+- **Dev dependencies** are excluded from end-user installs; they're only used for development and build steps.
 
-For this package, there is 1 dependency; and a few dev dependencies:
+For this package, there are 2 dependencies; and a few dev dependencies:
 
-- [noble-hashes](https://github.com/paulmillr/noble-hashes) provides cryptographic hashing functionality
-- micro-bmark, micro-should and jsbt are used for benchmarking / testing / build tooling and developed by the same author
-- prettier, fast-check and typescript are used for code quality / test generation / ts compilation. It's hard to audit their source code thoroughly and fully because of their size
+- [noble-hashes](https://github.com/paulmillr/noble-hashes) provides cryptographic hashing functionality, used internally in every algorithm
+- [noble-curves](https://github.com/paulmillr/noble-curves) provides elliptic curve cryptography for hybrid algorithms
+- jsbt is used for benchmarking / testing / build tooling and developed by the same author
+- prettier, fast-check and typescript are used for code quality / test generation / ts compilation
 
 ### Randomness
 
-We're deferring to built-in
-[crypto.getRandomValues](https://developer.mozilla.org/en-US/docs/Web/API/Crypto/getRandomValues)
-which is considered cryptographically secure (CSPRNG).
+We rely on the built-in
+[`crypto.getRandomValues`](https://developer.mozilla.org/en-US/docs/Web/API/Crypto/getRandomValues),
+which is considered a cryptographically secure PRNG.
 
-In the past, browsers had bugs that made it weak: it may happen again.
-Implementing a userspace CSPRNG to get resilient to the weakness
-is even worse: there is no reliable userspace source of quality entropy.
+Browsers have had weaknesses in the past - and could again - but implementing a userspace CSPRNG is even worse, as there’s no reliable userspace source of high-quality entropy.
 
 ## Speed
 
-Noble is the fastest JS implementation of post-quantum algorithms.
-WASM libraries can be faster.
-For SLH-DSA, SHAKE slows everything down 8x, and -s versions do another 20-50x slowdown.
+> `npm run bench`
+
+Noble is the fastest JS implementation of post-quantum algorithms. WASM libraries can be faster.
 
 Benchmarks on Apple M4 (**higher is better**):
 
@@ -282,16 +286,18 @@ sign x 8 ops/sec @ 114ms/op
 verify x 169 ops/sec @ 5ms/op
 ```
 
-SLH-DSA (\_shake is 8x slower):
+SLH-DSA:
 
 |           | sig size | keygen | sign   | verify |
 | --------- | -------- | ------ | ------ | ------ |
 | sha2_128f | 18088    | 4ms    | 90ms   | 6ms    |
-| sha2_128s | 7856     | 260ms  | 2000ms | 2ms    |
 | sha2_192f | 35664    | 6ms    | 160ms  | 9ms    |
-| sha2_192s | 16224    | 380ms  | 3800ms | 3ms    |
 | sha2_256f | 49856    | 15ms   | 340ms  | 9ms    |
+| sha2_128s | 7856     | 260ms  | 2000ms | 2ms    |
+| sha2_192s | 16224    | 380ms  | 3800ms | 3ms    |
 | sha2_256s | 29792    | 250ms  | 3400ms | 4ms    |
+| shake_192f | 35664   | 21ms   | 553ms  | 29ms   |
+| shake_192s | 16224   | 260ms  | 2635ms | 2ms    |
 
 ## Contributing & testing
 

@@ -1,6 +1,6 @@
 {
   "name": "@btc-vision/post-quantum",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "Auditable & minimal JS implementation of post-quantum cryptography: FIPS 203, 204, 205",
   "files": [
     "*.js",
@@ -14,9 +14,9 @@
     "@noble/hashes": "~2.0.0"
   },
   "devDependencies": {
-    "@paulmillr/jsbt": "0.4.4",
-    "@types/node": "24.10.0",
-    "fast-check": "4.3.0",
+    "@paulmillr/jsbt": "0.4.5",
+    "@types/node": "24.2.1",
+    "fast-check": "4.2.0",
     "prettier": "3.6.2",
     "typescript": "5.9.3"
   },
@@ -30,7 +30,7 @@
     "test:bun": "bun test/index.ts",
     "test:deno": "deno --allow-env --allow-read test/index.ts",
     "test:node20": "cd test; npx tsc; node compiled/test/index.js",
-    "test:big": "SLOW_TESTS=1 node test/index.ts"
+    "test:slow": "SLOW_TESTS=1 node test/index.ts"
   },
   "exports": {
     ".": "./index.js",
