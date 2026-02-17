@@ -1,5 +1,14 @@
 # Threshold ML-DSA: Post-Quantum t-of-n Threshold Signing
 
+## Technical Whitepaper
+
+**Version 1.1** | **February 2025**
+
+Based on *"Threshold Signatures Reloaded"* (Borin, Celi, del Pino, Espitau, Niot, Prest, 2025).
+
+Extended beyond the [Go reference implementation](https://github.com/GuilhemN/threshold-ml-dsa-and-raccoon) (Cloudflare CIRCL) with a full 3-round distributed signing protocol, security hardening for 5 known vulnerabilities in the Go reference, and native TypeScript class architecture.
+
+---
 
 ## Table of Contents
 
