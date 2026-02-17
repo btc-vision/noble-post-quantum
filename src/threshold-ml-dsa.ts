@@ -69,6 +69,108 @@ export interface ThresholdKeygenResult {
   readonly shares: readonly ThresholdKeyShare[];
 }
 
+// ==================== Distributed Protocol Types ====================
+
+/** Result from round 1 of the distributed signing protocol. */
+export interface Round1Result {
+  /** 32-byte commitment hash. Broadcast to all parties immediately. */
+  readonly commitmentHash: Uint8Array;
+  /** Private state — carries to round2() and round3(). Call destroy() when done. */
+  readonly state: Round1State;
+}
+
+/** Private state from round 1. Contains sensitive key material — DO NOT share. */
+export class Round1State {
+  readonly #stws: Float64Array[];
+  readonly #commitment: Uint8Array;
+  #destroyed: boolean;
+
+  /** @internal */
+  constructor(stws: Float64Array[], commitment: Uint8Array) {
+    this.#stws = stws;
+    this.#commitment = commitment;
+    this.#destroyed = false;
+  }
+
+  /** @internal */
+  get _stws(): readonly Float64Array[] {
+    if (this.#destroyed) throw new Error('Round1State has been destroyed');
+    return this.#stws;
+  }
+
+  /** @internal */
+  get _commitment(): Uint8Array {
+    if (this.#destroyed) throw new Error('Round1State has been destroyed');
+    return this.#commitment;
+  }
+
+  /** Zero out all sensitive data in this state. */
+  destroy(): void {
+    if (!this.#destroyed) {
+      for (const stw of this.#stws) stw.fill(0);
+      this.#destroyed = true;
+    }
+  }
+}
+
+/** Result from round 2 of the distributed signing protocol. */
+export interface Round2Result {
+  /** Packed commitment data. Broadcast to all parties. */
+  readonly commitment: Uint8Array;
+  /** Private state — carries to round3(). Call destroy() when done. */
+  readonly state: Round2State;
+}
+
+/** Private state from round 2. Contains message digest. */
+export class Round2State {
+  readonly #hashes: Uint8Array[];
+  readonly #mu: Uint8Array;
+  readonly #act: number;
+  readonly #activePartyIds: number[];
+  #destroyed: boolean;
+
+  /** @internal */
+  constructor(hashes: Uint8Array[], mu: Uint8Array, act: number, activePartyIds: number[]) {
+    this.#hashes = hashes;
+    this.#mu = mu;
+    this.#act = act;
+    this.#activePartyIds = activePartyIds;
+    this.#destroyed = false;
+  }
+
+  /** @internal */
+  get _hashes(): readonly Uint8Array[] {
+    if (this.#destroyed) throw new Error('Round2State has been destroyed');
+    return this.#hashes;
+  }
+
+  /** @internal */
+  get _mu(): Uint8Array {
+    if (this.#destroyed) throw new Error('Round2State has been destroyed');
+    return this.#mu;
+  }
+
+  /** @internal */
+  get _act(): number {
+    if (this.#destroyed) throw new Error('Round2State has been destroyed');
+    return this.#act;
+  }
+
+  /** @internal */
+  get _activePartyIds(): readonly number[] {
+    if (this.#destroyed) throw new Error('Round2State has been destroyed');
+    return this.#activePartyIds;
+  }
+
+  /** Zero out message digest. */
+  destroy(): void {
+    if (!this.#destroyed) {
+      this.#mu.fill(0);
+      this.#destroyed = true;
+    }
+  }
+}
+
 // ==================== Parameter Tables ====================
 
 /** ML-DSA-44 threshold parameters: [K_iter, r, rPrime] indexed by [T-2][N-2]. */
@@ -169,6 +271,36 @@ function polyUnpackW(p: Int32Array, buf: Uint8Array, offset: number): void {
 
 /** Size in bytes of one 23-bit-packed polynomial. */
 const POLY_Q_SIZE = (N * 23) / 8; // 736
+
+/** Pack K_iter arrays of dim polynomials into bytes (23-bit per coefficient). */
+function packPolys(polys: Int32Array[][], dim: number, K_iter: number): Uint8Array {
+  const buf = new Uint8Array(K_iter * dim * POLY_Q_SIZE);
+  for (let iter = 0; iter < K_iter; iter++) {
+    for (let j = 0; j < dim; j++) {
+      polyPackW(polys[iter][j], buf, (iter * dim + j) * POLY_Q_SIZE);
+    }
+  }
+  return buf;
+}
+
+/** Unpack bytes into K_iter arrays of dim polynomials. */
+function unpackPolys(buf: Uint8Array, dim: number, K_iter: number): Int32Array[][] {
+  const expected = K_iter * dim * POLY_Q_SIZE;
+  if (buf.length !== expected) {
+    throw new Error(`Invalid buffer length: expected ${expected}, got ${buf.length}`);
+  }
+  const result: Int32Array[][] = [];
+  for (let iter = 0; iter < K_iter; iter++) {
+    const polys: Int32Array[] = [];
+    for (let j = 0; j < dim; j++) {
+      const p = new Int32Array(N);
+      polyUnpackW(p, buf, (iter * dim + j) * POLY_Q_SIZE);
+      polys.push(p);
+    }
+    result.push(polys);
+  }
+  return result;
+}
 
 function getDSAOpts(securityLevel: number) {
   let paramKey: string;
@@ -403,10 +535,24 @@ export class ThresholdMLDSA {
     return { T, N: N_, K_iter, nu: 3.0, r, rPrime };
   }
 
-  /** Generate threshold keys from a seed. */
+  /**
+   * Generate threshold keys from a seed (trusted dealer model).
+   *
+   * A single trusted dealer generates all N key shares and the public key.
+   * After distributing shares to parties over secure channels, the dealer
+   * MUST securely erase the seed and all share data. After distribution,
+   * no single party holds the full signing key.
+   *
+   * For environments where no single party can be trusted with all shares,
+   * use an external MPC protocol to generate the shared seed, then pass it
+   * here. Alternatively, run keygen on an air-gapped machine and physically
+   * destroy it after share distribution.
+   *
+   * @param seed - 32-byte seed. Default: random.
+   */
   keygen(seed?: Uint8Array): ThresholdKeygenResult {
     const p = this.#primitives;
-    const { K, L, TR_BYTES, ETA } = p;
+    const { K, L, TR_BYTES } = p;
     const params = this.params;
 
     if (seed === undefined) seed = randomBytes(32);
@@ -558,7 +704,12 @@ export class ThresholdMLDSA {
   }
 
   /**
-   * Full threshold signing protocol (convenience method for local signing).
+   * Full threshold signing protocol (local convenience method).
+   *
+   * Runs all 3 rounds of the distributed protocol locally. Useful for
+   * testing and single-machine deployments. For network-distributed signing,
+   * use the round1() → round2() → round3() → combine() methods instead.
+   *
    * @param msg - Message to sign
    * @param publicKey - The threshold public key
    * @param shares - At least T threshold key shares
@@ -643,6 +794,206 @@ export class ThresholdMLDSA {
     // H6 fix: zero secret material on failure path too
     mu.fill(0);
     throw new Error('Failed to produce valid threshold signature after 500 attempts');
+  }
+
+  // ==================== Distributed Signing Protocol ====================
+
+  /**
+   * Round 1: Generate commitment for distributed threshold signing.
+   *
+   * Each party calls this independently with fresh randomness.
+   * The returned commitmentHash (32 bytes) should be broadcast to all parties.
+   * The commitment (packed w vectors) is NOT revealed until all hashes are received
+   * (this prevents an adaptive attack where a party chooses their commitment
+   * based on others' values).
+   *
+   * @param share - This party's key share
+   * @param opts - Optional: nonce (default 0), rhop (default random 64 bytes)
+   */
+  round1(
+    share: ThresholdKeyShare,
+    opts?: { readonly nonce?: number; readonly rhop?: Uint8Array }
+  ): Round1Result {
+    const p = this.#primitives;
+    const params = this.params;
+    const nonce = opts?.nonce ?? 0;
+    let rhop = opts?.rhop;
+
+    if (!rhop) rhop = randomBytes(64);
+    abytes(rhop, 64, 'rhop');
+
+    const { ws, stws } = this.#genCommitment(share, rhop, nonce, params);
+    const commitment = packPolys(ws, p.K, params.K_iter);
+    const commitmentHash = this.#hashCommitment(share.tr, share.id, commitment);
+
+    return {
+      commitmentHash,
+      state: new Round1State(stws, commitment),
+    };
+  }
+
+  /**
+   * Round 2: Receive all commitment hashes, reveal own commitment.
+   *
+   * After receiving commitment hashes from all active parties, each party
+   * stores the hashes (for verification in round 3), computes the message
+   * digest mu, and reveals their own packed commitment data.
+   *
+   * @param share - This party's key share
+   * @param activePartyIds - IDs of all participating parties (including this one)
+   * @param msg - Message to sign
+   * @param round1Hashes - Commitment hashes from all active parties (same order as activePartyIds)
+   * @param round1State - This party's state from round1()
+   * @param opts - Optional context
+   */
+  round2(
+    share: ThresholdKeyShare,
+    activePartyIds: readonly number[],
+    msg: Uint8Array,
+    round1Hashes: readonly Uint8Array[],
+    round1State: Round1State,
+    opts?: { readonly context?: Uint8Array }
+  ): Round2Result {
+    const p = this.#primitives;
+    const params = this.params;
+    const ctx = opts?.context ?? new Uint8Array(0);
+
+    if (activePartyIds.length < params.T) {
+      throw new Error(`Need at least ${params.T} parties, got ${activePartyIds.length}`);
+    }
+    if (round1Hashes.length !== activePartyIds.length) {
+      throw new Error(`Expected ${activePartyIds.length} hashes, got ${round1Hashes.length}`);
+    }
+
+    // Validate unique party IDs and compute bitmask
+    let act = 0;
+    for (const id of activePartyIds) {
+      const bit = 1 << id;
+      if (act & bit) throw new Error(`Duplicate party ID: ${id}`);
+      act |= bit;
+    }
+
+    // Store hashes for verification in round 3
+    const hashes = round1Hashes.map((h) => h.slice());
+
+    // Compute mu = H(tr || getMessage(msg, ctx))
+    const M = getMessage(msg, ctx);
+    const mu = shake256.create({ dkLen: p.CRH_BYTES }).update(share.tr).update(M).digest();
+
+    return {
+      commitment: round1State._commitment.slice(),
+      state: new Round2State(hashes, mu, act, [...activePartyIds]),
+    };
+  }
+
+  /**
+   * Round 3: Receive all commitments, verify against hashes, compute partial response.
+   *
+   * After receiving all parties' commitment reveals, each party:
+   * 1. Verifies each commitment matches the hash broadcast in round 1
+   * 2. Aggregates all commitments
+   * 3. Computes their partial response (z vectors)
+   *
+   * @param share - This party's key share
+   * @param commitments - Packed commitments from all active parties (same order as activePartyIds in round2)
+   * @param round1State - This party's state from round1()
+   * @param round2State - This party's state from round2()
+   * @returns Packed partial response to broadcast
+   */
+  round3(
+    share: ThresholdKeyShare,
+    commitments: readonly Uint8Array[],
+    round1State: Round1State,
+    round2State: Round2State
+  ): Uint8Array {
+    const p = this.#primitives;
+    const params = this.params;
+    const { K, L } = p;
+
+    const activePartyIds = round2State._activePartyIds;
+    const hashes = round2State._hashes;
+    const mu = round2State._mu;
+    const act = round2State._act;
+
+    if (commitments.length !== activePartyIds.length) {
+      throw new Error(`Expected ${activePartyIds.length} commitments, got ${commitments.length}`);
+    }
+
+    // Verify each commitment against stored hash (binding check)
+    for (let i = 0; i < commitments.length; i++) {
+      const expected = this.#hashCommitment(share.tr, activePartyIds[i], commitments[i]);
+      let diff = 0;
+      for (let j = 0; j < expected.length; j++) diff |= expected[j] ^ hashes[i][j];
+      if (diff !== 0) {
+        throw new Error(`Commitment hash mismatch for party ${activePartyIds[i]}`);
+      }
+    }
+
+    // Unpack and aggregate commitments
+    const allWs = commitments.map((c) => unpackPolys(c, K, params.K_iter));
+    const wfinals = this.#aggregateCommitments(allWs, params);
+
+    // Compute this party's partial response
+    const stws = round1State._stws;
+    const zs = this.#computeResponses(share, act, mu, wfinals, stws, params);
+
+    return packPolys(zs, L, params.K_iter);
+  }
+
+  /**
+   * Combine: Aggregate all parties' data and produce a standard FIPS 204 signature.
+   *
+   * Anyone with the public key can perform this step — it does not require
+   * secret key material. Takes per-party commitments and responses, aggregates
+   * them internally, and attempts to produce a valid signature.
+   *
+   * @param publicKey - The threshold public key
+   * @param msg - Message that was signed
+   * @param commitments - Packed commitments from all active parties
+   * @param responses - Packed responses from all active parties
+   * @param opts - Optional context (must match what was used in round2)
+   * @returns Standard FIPS 204 signature, or null if this attempt failed (retry from round1)
+   */
+  combine(
+    publicKey: Uint8Array,
+    msg: Uint8Array,
+    commitments: readonly Uint8Array[],
+    responses: readonly Uint8Array[],
+    opts?: { readonly context?: Uint8Array }
+  ): Uint8Array | null {
+    const p = this.#primitives;
+    const { K, L } = p;
+    const params = this.params;
+    const ctx = opts?.context ?? new Uint8Array(0);
+
+    abytes(publicKey, p.publicCoder.bytesLen, 'publicKey');
+
+    // Compute mu = H(tr || getMessage(msg, ctx)) where tr = H(publicKey)
+    const M = getMessage(msg, ctx);
+    const tr = shake256(publicKey, { dkLen: p.TR_BYTES });
+    const mu = shake256.create({ dkLen: p.CRH_BYTES }).update(tr).update(M).digest();
+
+    // Unpack and aggregate commitments
+    const allWs = commitments.map((c) => unpackPolys(c, K, params.K_iter));
+    const wfinals = this.#aggregateCommitments(allWs, params);
+
+    // Unpack and aggregate responses
+    const allZs = responses.map((r) => unpackPolys(r, L, params.K_iter));
+    const zfinals = this.#aggregateResponses(allZs, params);
+
+    const result = this.#combine(publicKey, mu, wfinals, zfinals, params);
+    mu.fill(0);
+    return result;
+  }
+
+  /** Get the byte size of a packed commitment from round1. */
+  get commitmentByteLength(): number {
+    return this.params.K_iter * this.#primitives.K * POLY_Q_SIZE;
+  }
+
+  /** Get the byte size of a packed response from round3. */
+  get responseByteLength(): number {
+    return this.params.K_iter * this.#primitives.L * POLY_Q_SIZE;
   }
 
   // ==================== Private Methods ====================
@@ -833,13 +1184,23 @@ export class ThresholdMLDSA {
     return wfinals;
   }
 
+  /** Compute commitment hash: SHAKE256(tr || partyId || commitment). Matches Go reference. */
+  #hashCommitment(tr: Uint8Array, partyId: number, commitment: Uint8Array): Uint8Array {
+    return shake256
+      .create({ dkLen: 32 })
+      .update(tr)
+      .update(new Uint8Array([partyId]))
+      .update(commitment)
+      .digest();
+  }
+
   /** Compute responses for a party. */
   #computeResponses(
     share: ThresholdKeyShare,
     act: number,
     mu: Uint8Array,
     wfinals: Int32Array[][],
-    stws: Float64Array[],
+    stws: readonly Float64Array[],
     params: ThresholdParams
   ): Int32Array[][] {
     const p = this.#primitives;

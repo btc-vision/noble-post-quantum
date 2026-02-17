@@ -1,7 +1,7 @@
 import { describe, should } from '@paulmillr/jsbt/test.js';
 import { deepStrictEqual as eql, throws } from 'node:assert';
 import { ml_dsa44, ml_dsa65, ml_dsa87 } from '../src/ml-dsa.ts';
-import { ThresholdMLDSA } from '../src/threshold-ml-dsa.ts';
+import { ThresholdMLDSA, Round1State, Round2State } from '../src/threshold-ml-dsa.ts';
 
 describe('Threshold ML-DSA', () => {
   describe('Parameter validation', () => {
@@ -469,6 +469,311 @@ describe('Threshold ML-DSA', () => {
       // Providing all 4 shares to a 2-of-4 scheme should work (uses first 2)
       const sig = th.sign(msg, publicKey, [shares[0], shares[1], shares[2], shares[3]]);
       eql(ml_dsa44.verify(sig, msg, publicKey), true);
+    });
+  });
+
+  describe('Distributed signing protocol', () => {
+    should('produce valid signature via round1→round2→round3→combine (2-of-3)', () => {
+      const th = ThresholdMLDSA.create(44, 2, 3);
+      const seed = new Uint8Array(32);
+      seed[0] = 200;
+      const { publicKey, shares } = th.keygen(seed);
+      const msg = new Uint8Array([10, 20, 30]);
+      const activePartyIds = [0, 1];
+
+      let sig: Uint8Array | null = null;
+      for (let attempt = 0; attempt < 500; attempt++) {
+        // Round 1: each party independently
+        const r1_0 = th.round1(shares[0], { nonce: attempt });
+        const r1_1 = th.round1(shares[1], { nonce: attempt });
+
+        // Round 2: exchange hashes, get commitments
+        const allHashes = [r1_0.commitmentHash, r1_1.commitmentHash];
+        const r2_0 = th.round2(shares[0], activePartyIds, msg, allHashes, r1_0.state);
+        const r2_1 = th.round2(shares[1], activePartyIds, msg, allHashes, r1_1.state);
+
+        // Round 3: exchange commitments, compute responses
+        const allCommitments = [r2_0.commitment, r2_1.commitment];
+        const resp_0 = th.round3(shares[0], allCommitments, r1_0.state, r2_0.state);
+        const resp_1 = th.round3(shares[1], allCommitments, r1_1.state, r2_1.state);
+
+        // Combine
+        sig = th.combine(publicKey, msg, allCommitments, [resp_0, resp_1]);
+        r1_0.state.destroy();
+        r1_1.state.destroy();
+        r2_0.state.destroy();
+        r2_1.state.destroy();
+        if (sig !== null) break;
+      }
+
+      eql(sig !== null, true);
+      eql(ml_dsa44.verify(sig!, msg, publicKey), true);
+    });
+
+    should('produce valid signature via distributed protocol (2-of-3, parties 0,2)', () => {
+      const th = ThresholdMLDSA.create(44, 2, 3);
+      const seed = new Uint8Array(32);
+      seed[0] = 201;
+      const { publicKey, shares } = th.keygen(seed);
+      const msg = new Uint8Array([1, 2, 3, 4, 5]);
+      const activePartyIds = [0, 2];
+
+      let sig: Uint8Array | null = null;
+      for (let attempt = 0; attempt < 500; attempt++) {
+        const r1_0 = th.round1(shares[0], { nonce: attempt });
+        const r1_2 = th.round1(shares[2], { nonce: attempt });
+
+        const allHashes = [r1_0.commitmentHash, r1_2.commitmentHash];
+        const r2_0 = th.round2(shares[0], activePartyIds, msg, allHashes, r1_0.state);
+        const r2_2 = th.round2(shares[2], activePartyIds, msg, allHashes, r1_2.state);
+
+        const allCommitments = [r2_0.commitment, r2_2.commitment];
+        const resp_0 = th.round3(shares[0], allCommitments, r1_0.state, r2_0.state);
+        const resp_2 = th.round3(shares[2], allCommitments, r1_2.state, r2_2.state);
+
+        sig = th.combine(publicKey, msg, allCommitments, [resp_0, resp_2]);
+        r1_0.state.destroy();
+        r1_2.state.destroy();
+        r2_0.state.destroy();
+        r2_2.state.destroy();
+        if (sig !== null) break;
+      }
+
+      eql(sig !== null, true);
+      eql(ml_dsa44.verify(sig!, msg, publicKey), true);
+    });
+
+    should('produce valid signature with context via distributed protocol', () => {
+      const th = ThresholdMLDSA.create(44, 2, 3);
+      const seed = new Uint8Array(32);
+      seed[0] = 202;
+      const { publicKey, shares } = th.keygen(seed);
+      const msg = new Uint8Array([99]);
+      const ctx = new Uint8Array([0xde, 0xad]);
+      const activePartyIds = [0, 1];
+
+      let sig: Uint8Array | null = null;
+      for (let attempt = 0; attempt < 500; attempt++) {
+        const r1_0 = th.round1(shares[0], { nonce: attempt });
+        const r1_1 = th.round1(shares[1], { nonce: attempt });
+
+        const allHashes = [r1_0.commitmentHash, r1_1.commitmentHash];
+        const r2_0 = th.round2(shares[0], activePartyIds, msg, allHashes, r1_0.state, { context: ctx });
+        const r2_1 = th.round2(shares[1], activePartyIds, msg, allHashes, r1_1.state, { context: ctx });
+
+        const allCommitments = [r2_0.commitment, r2_1.commitment];
+        const resp_0 = th.round3(shares[0], allCommitments, r1_0.state, r2_0.state);
+        const resp_1 = th.round3(shares[1], allCommitments, r1_1.state, r2_1.state);
+
+        sig = th.combine(publicKey, msg, allCommitments, [resp_0, resp_1], { context: ctx });
+        r1_0.state.destroy();
+        r1_1.state.destroy();
+        r2_0.state.destroy();
+        r2_1.state.destroy();
+        if (sig !== null) break;
+      }
+
+      eql(sig !== null, true);
+      // Verify with context
+      eql(ml_dsa44.verify(sig!, msg, publicKey, { context: ctx }), true);
+      // Verify without context fails
+      eql(ml_dsa44.verify(sig!, msg, publicKey), false);
+    });
+
+    should('commitment byte length matches actual commitment', () => {
+      const th = ThresholdMLDSA.create(44, 2, 3);
+      const { shares } = th.keygen();
+      const r1 = th.round1(shares[0]);
+      eql(r1.state._commitment.length, th.commitmentByteLength);
+      r1.state.destroy();
+    });
+
+    should('response byte length matches actual response', () => {
+      const th = ThresholdMLDSA.create(44, 2, 3);
+      const seed = new Uint8Array(32);
+      seed[0] = 203;
+      const { publicKey, shares } = th.keygen(seed);
+      const msg = new Uint8Array([1]);
+      const activePartyIds = [0, 1];
+
+      const r1_0 = th.round1(shares[0]);
+      const r1_1 = th.round1(shares[1]);
+      const allHashes = [r1_0.commitmentHash, r1_1.commitmentHash];
+      const r2_0 = th.round2(shares[0], activePartyIds, msg, allHashes, r1_0.state);
+      const r2_1 = th.round2(shares[1], activePartyIds, msg, allHashes, r1_1.state);
+      const allCommitments = [r2_0.commitment, r2_1.commitment];
+      const resp = th.round3(shares[0], allCommitments, r1_0.state, r2_0.state);
+
+      eql(resp.length, th.responseByteLength);
+      r1_0.state.destroy();
+      r1_1.state.destroy();
+      r2_0.state.destroy();
+      r2_1.state.destroy();
+    });
+
+    should('commitment hash is 32 bytes', () => {
+      const th = ThresholdMLDSA.create(44, 2, 3);
+      const { shares } = th.keygen();
+      const r1 = th.round1(shares[0]);
+      eql(r1.commitmentHash.length, 32);
+      r1.state.destroy();
+    });
+
+    should('Round1State.destroy() prevents reuse', () => {
+      const th = ThresholdMLDSA.create(44, 2, 3);
+      const { shares } = th.keygen();
+      const r1 = th.round1(shares[0]);
+      r1.state.destroy();
+      throws(() => r1.state._commitment, /destroyed/);
+      throws(() => r1.state._stws, /destroyed/);
+    });
+
+    should('Round2State.destroy() prevents reuse', () => {
+      const th = ThresholdMLDSA.create(44, 2, 3);
+      const { shares } = th.keygen();
+      const msg = new Uint8Array([1]);
+      const r1 = th.round1(shares[0]);
+      const r2 = th.round2(shares[0], [0, 1], msg, [r1.commitmentHash, r1.commitmentHash], r1.state);
+      r2.state.destroy();
+      throws(() => r2.state._mu, /destroyed/);
+      throws(() => r2.state._hashes, /destroyed/);
+      r1.state.destroy();
+    });
+
+    should('round3 rejects tampered commitment (hash mismatch)', () => {
+      const th = ThresholdMLDSA.create(44, 2, 3);
+      const seed = new Uint8Array(32);
+      seed[0] = 204;
+      const { shares } = th.keygen(seed);
+      const msg = new Uint8Array([1]);
+      const activePartyIds = [0, 1];
+
+      const r1_0 = th.round1(shares[0]);
+      const r1_1 = th.round1(shares[1]);
+      const allHashes = [r1_0.commitmentHash, r1_1.commitmentHash];
+      const r2_0 = th.round2(shares[0], activePartyIds, msg, allHashes, r1_0.state);
+      const r2_1 = th.round2(shares[1], activePartyIds, msg, allHashes, r1_1.state);
+
+      // Tamper with party 1's commitment
+      const tampered = r2_1.commitment.slice();
+      tampered[0] ^= 0xff;
+
+      throws(
+        () => th.round3(shares[0], [r2_0.commitment, tampered], r1_0.state, r2_0.state),
+        /Commitment hash mismatch for party 1/
+      );
+      r1_0.state.destroy();
+      r1_1.state.destroy();
+      r2_0.state.destroy();
+      r2_1.state.destroy();
+    });
+
+    should('round2 rejects wrong number of hashes', () => {
+      const th = ThresholdMLDSA.create(44, 2, 3);
+      const { shares } = th.keygen();
+      const r1 = th.round1(shares[0]);
+      throws(
+        () => th.round2(shares[0], [0, 1], new Uint8Array([1]), [r1.commitmentHash], r1.state),
+        /Expected 2 hashes, got 1/
+      );
+      r1.state.destroy();
+    });
+
+    should('round2 rejects insufficient parties', () => {
+      const th = ThresholdMLDSA.create(44, 2, 3);
+      const { shares } = th.keygen();
+      const r1 = th.round1(shares[0]);
+      throws(
+        () => th.round2(shares[0], [0], new Uint8Array([1]), [r1.commitmentHash], r1.state),
+        /Need at least 2 parties/
+      );
+      r1.state.destroy();
+    });
+
+    should('round2 rejects duplicate party IDs', () => {
+      const th = ThresholdMLDSA.create(44, 2, 3);
+      const { shares } = th.keygen();
+      const r1 = th.round1(shares[0]);
+      throws(
+        () =>
+          th.round2(
+            shares[0],
+            [0, 0],
+            new Uint8Array([1]),
+            [r1.commitmentHash, r1.commitmentHash],
+            r1.state
+          ),
+        /Duplicate party ID/
+      );
+      r1.state.destroy();
+    });
+
+    should('distributed protocol works with ML-DSA-65', () => {
+      const th = ThresholdMLDSA.create(65, 2, 2);
+      const seed = new Uint8Array(32);
+      seed[0] = 205;
+      const { publicKey, shares } = th.keygen(seed);
+      const msg = new Uint8Array([42]);
+      const activePartyIds = [0, 1];
+
+      let sig: Uint8Array | null = null;
+      for (let attempt = 0; attempt < 500; attempt++) {
+        const r1_0 = th.round1(shares[0], { nonce: attempt });
+        const r1_1 = th.round1(shares[1], { nonce: attempt });
+        const allHashes = [r1_0.commitmentHash, r1_1.commitmentHash];
+        const r2_0 = th.round2(shares[0], activePartyIds, msg, allHashes, r1_0.state);
+        const r2_1 = th.round2(shares[1], activePartyIds, msg, allHashes, r1_1.state);
+        const allCommitments = [r2_0.commitment, r2_1.commitment];
+        const resp_0 = th.round3(shares[0], allCommitments, r1_0.state, r2_0.state);
+        const resp_1 = th.round3(shares[1], allCommitments, r1_1.state, r2_1.state);
+        sig = th.combine(publicKey, msg, allCommitments, [resp_0, resp_1]);
+        r1_0.state.destroy();
+        r1_1.state.destroy();
+        r2_0.state.destroy();
+        r2_1.state.destroy();
+        if (sig !== null) break;
+      }
+
+      eql(sig !== null, true);
+      eql(ml_dsa65.verify(sig!, msg, publicKey), true);
+    });
+
+    should('distributed and local sign produce valid but independent signatures', () => {
+      const th = ThresholdMLDSA.create(44, 2, 3);
+      const seed = new Uint8Array(32);
+      seed[0] = 206;
+      const { publicKey, shares } = th.keygen(seed);
+      const msg = new Uint8Array([7, 8, 9]);
+
+      // Local sign
+      const sigLocal = th.sign(msg, publicKey, [shares[0], shares[1]]);
+      eql(ml_dsa44.verify(sigLocal, msg, publicKey), true);
+
+      // Distributed sign
+      const activePartyIds = [0, 1];
+      let sigDistributed: Uint8Array | null = null;
+      for (let attempt = 0; attempt < 500; attempt++) {
+        const r1_0 = th.round1(shares[0], { nonce: attempt });
+        const r1_1 = th.round1(shares[1], { nonce: attempt });
+        const allHashes = [r1_0.commitmentHash, r1_1.commitmentHash];
+        const r2_0 = th.round2(shares[0], activePartyIds, msg, allHashes, r1_0.state);
+        const r2_1 = th.round2(shares[1], activePartyIds, msg, allHashes, r1_1.state);
+        const allCommitments = [r2_0.commitment, r2_1.commitment];
+        const resp_0 = th.round3(shares[0], allCommitments, r1_0.state, r2_0.state);
+        const resp_1 = th.round3(shares[1], allCommitments, r1_1.state, r2_1.state);
+        sigDistributed = th.combine(publicKey, msg, allCommitments, [resp_0, resp_1]);
+        r1_0.state.destroy();
+        r1_1.state.destroy();
+        r2_0.state.destroy();
+        r2_1.state.destroy();
+        if (sigDistributed !== null) break;
+      }
+
+      eql(sigDistributed !== null, true);
+      eql(ml_dsa44.verify(sigDistributed!, msg, publicKey), true);
+
+      // Both produce valid signatures (but different due to randomness)
+      eql(sigLocal.length, sigDistributed!.length);
     });
   });
 });
