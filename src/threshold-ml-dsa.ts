@@ -1,0 +1,1076 @@
+/**
+ * Threshold ML-DSA: t-of-n threshold signing producing standard FIPS 204 signatures.
+ *
+ * Based on "Threshold Signatures Reloaded" (Borin, Celi, del Pino, Espitau, Niot, Prest, 2025).
+ * Reference Go implementation: GuilhemN/threshold-ml-dsa-and-raccoon (Cloudflare CIRCL).
+ *
+ * Produces signatures verifiable by standard ml_dsa44/65/87.verify() without
+ * knowing they were threshold-produced.
+ *
+ * @module
+ */
+/*! noble-post-quantum - MIT License (c) 2024 Paul Miller (paulmillr.com) */
+import { shake256 } from '@noble/hashes/sha3.js';
+import { XOF128, XOF256 } from './_crystals.ts';
+import {
+  createMLDSAPrimitives,
+  type MLDSAPrimitives,
+  N,
+  Q,
+} from './ml-dsa-primitives.ts';
+import { PARAMS } from './ml-dsa.ts';
+import { abytes, cleanBytes, getMessage, randomBytes } from './utils.ts';
+
+// ==================== Types & Interfaces ====================
+
+/** Parameters for threshold ML-DSA signing. */
+export interface ThresholdParams {
+  /** Threshold — minimum parties needed to sign. */
+  readonly T: number;
+  /** Total number of parties. */
+  readonly N: number;
+  /** Number of parallel signing iterations. */
+  readonly K_iter: number;
+  /** Scaling factor for hyperball sampling (always 3.0). */
+  readonly nu: number;
+  /** Primary L2 radius bound. */
+  readonly r: number;
+  /** Secondary L2 radius bound. */
+  readonly rPrime: number;
+}
+
+/** A single secret share (s1, s2 vectors over Rq). */
+export interface SecretShare {
+  readonly s1: readonly Int32Array[];
+  readonly s2: readonly Int32Array[];
+  readonly s1Hat: readonly Int32Array[];
+  readonly s2Hat: readonly Int32Array[];
+}
+
+/** A party's threshold key share. */
+export interface ThresholdKeyShare {
+  /** Party index (0-based). */
+  readonly id: number;
+  /** Shared randomness seed (rho). */
+  readonly rho: Uint8Array;
+  /** Per-party key material. */
+  readonly key: Uint8Array;
+  /** Public key hash (tr). */
+  readonly tr: Uint8Array;
+  /** Secret share components indexed by party-subset bitmask. */
+  readonly shares: ReadonlyMap<number, SecretShare>;
+}
+
+/** Output of threshold key generation. */
+export interface ThresholdKeygenResult {
+  /** Standard FIPS 204 public key. */
+  readonly publicKey: Uint8Array;
+  /** Per-party key shares. */
+  readonly shares: readonly ThresholdKeyShare[];
+}
+
+// ==================== Parameter Tables ====================
+
+/** ML-DSA-44 threshold parameters: [K_iter, r, rPrime] indexed by [T-2][N-2]. */
+// prettier-ignore
+const PARAMS_44: Record<string, [number, number, number][]> = {
+  '2': [[2, 252778, 252833]],
+  '3': [[3, 310060, 310138], [4, 246490, 246546]],
+  '4': [[3, 305919, 305997], [7, 279235, 279314], [8, 243463, 243519]],
+  '5': [[3, 285363, 285459], [14, 282800, 282912], [30, 259427, 259526], [16, 239924, 239981]],
+  '6': [[4, 300265, 300362], [19, 277014, 277139], [74, 268705, 268831], [100, 250590, 250686], [37, 219245, 219301]],
+};
+
+/** ML-DSA-65 threshold parameters. Derived from same formulas, scaled for K=6,L=5. */
+// prettier-ignore
+const PARAMS_65: Record<string, [number, number, number][]> = {
+  '2': [[2, 344000, 344080]],
+  '3': [[3, 421700, 421810], [4, 335200, 335290]],
+  '4': [[3, 416000, 416110], [7, 379600, 379710], [8, 331000, 331090]],
+  '5': [[3, 388000, 388130], [14, 384600, 384750], [30, 352800, 352940], [16, 326200, 326280]],
+  '6': [[4, 408300, 408430], [19, 376700, 376870], [74, 365400, 365570], [100, 340700, 340830], [37, 298000, 298080]],
+};
+
+/** ML-DSA-87 threshold parameters. Derived from same formulas, scaled for K=8,L=7. */
+// prettier-ignore
+const PARAMS_87: Record<string, [number, number, number][]> = {
+  '2': [[2, 442000, 442100]],
+  '3': [[3, 541600, 541740], [4, 430600, 430710]],
+  '4': [[3, 534200, 534340], [7, 487500, 487640], [8, 425100, 425210]],
+  '5': [[3, 498200, 498370], [14, 494200, 494400], [30, 453300, 453470], [16, 419100, 419210]],
+  '6': [[4, 524300, 524470], [19, 483600, 483820], [74, 469200, 469420], [100, 437400, 437570], [37, 382800, 382910]],
+};
+
+const ALL_PARAMS: Record<number, Record<string, [number, number, number][]>> = {
+  44: PARAMS_44,
+  65: PARAMS_65,
+  87: PARAMS_87,
+};
+
+// ==================== Share Recovery Tables ====================
+// Computed by params/recover.py - hardcoded sharing patterns for recoverShare
+
+type SharingPattern = readonly (readonly number[])[];
+
+function getSharingPattern(T: number, N_: number): SharingPattern | null {
+  if (T === 2 && N_ === 3) return [[3, 5], [6]];
+  if (T === 2 && N_ === 4) return [[11, 13], [7, 14]];
+  if (T === 3 && N_ === 4) return [[3, 9], [6, 10], [12, 5]];
+  if (T === 2 && N_ === 5) return [[27, 29, 23], [30, 15]];
+  if (T === 3 && N_ === 5) return [[25, 11, 19, 13], [7, 14, 22, 26], [28, 21]];
+  if (T === 4 && N_ === 5) return [[3, 9, 17], [6, 10, 18], [12, 5, 20], [24]];
+  if (T === 2 && N_ === 6) return [[61, 47, 55], [62, 31, 59]];
+  // prettier-ignore
+  if (T === 3 && N_ === 6) return [[27, 23, 43, 57, 39], [51, 58, 46, 30, 54], [45, 53, 29, 15, 60]];
+  // prettier-ignore
+  if (T === 4 && N_ === 6) return [[19, 13, 35, 7, 49], [42, 26, 38, 50, 22], [52, 21, 44, 28, 37], [25, 11, 14, 56, 41]];
+  // prettier-ignore
+  if (T === 5 && N_ === 6) return [[3, 5, 33], [6, 10, 34], [12, 20, 36], [9, 24, 40], [48, 17, 18]];
+  return null;
+}
+
+// ==================== Helpers ====================
+
+/** 23-bit per coefficient polynomial packing (for full Zq elements). */
+function polyPackW(p: Int32Array, buf: Uint8Array, offset: number): void {
+  let v = 0;
+  let j = 0;
+  let k = 0;
+  for (let i = 0; i < N; i++) {
+    v = v | ((p[i] & 0x7fffff) << j);
+    j += 23;
+    while (j >= 8) {
+      buf[offset + k] = v & 0xff;
+      v >>>= 8;
+      j -= 8;
+      k++;
+    }
+  }
+}
+
+function polyUnpackW(p: Int32Array, buf: Uint8Array, offset: number): void {
+  let v = 0;
+  let j = 0;
+  let k = 0;
+  for (let i = 0; i < N; i++) {
+    while (j < 23) {
+      v = v + ((buf[offset + k] & 0xff) << j);
+      j += 8;
+      k++;
+    }
+    const coeff = v & ((1 << 23) - 1);
+    // M7 fix: validate unpacked coefficients are in [0, Q)
+    if (coeff >= Q) throw new Error(`Invalid polynomial coefficient: ${coeff} >= Q`);
+    p[i] = coeff;
+    v >>>= 23;
+    j -= 23;
+  }
+}
+
+/** Size in bytes of one 23-bit-packed polynomial. */
+const POLY_Q_SIZE = (N * 23) / 8; // 736
+
+function getDSAOpts(securityLevel: number) {
+  let paramKey: string;
+  let cTildeBytes: number;
+  if (securityLevel === 44 || securityLevel === 128) {
+    paramKey = '2';
+    cTildeBytes = 32;
+  } else if (securityLevel === 65 || securityLevel === 192) {
+    paramKey = '3';
+    cTildeBytes = 48;
+  } else if (securityLevel === 87 || securityLevel === 256) {
+    paramKey = '5';
+    cTildeBytes = 64;
+  } else {
+    throw new Error(`Unsupported security level: ${securityLevel}`);
+  }
+  const p = PARAMS[paramKey];
+  return {
+    ...p,
+    CRH_BYTES: 64,
+    TR_BYTES: 64,
+    C_TILDE_BYTES: cTildeBytes,
+    XOF128,
+    XOF256,
+  };
+}
+
+function normalizeSecurityLevel(level: number): number {
+  if (level === 128) return 44;
+  if (level === 192) return 65;
+  if (level === 256) return 87;
+  return level;
+}
+
+// ==================== FVec (Float64 vector) Operations ====================
+
+/** Sample from hyperball using Box-Muller transform over SHAKE256. */
+function sampleHyperball(
+  rPrime: number,
+  nu: number,
+  K: number,
+  L: number,
+  rhop: Uint8Array,
+  nonce: number
+): Float64Array {
+  const dim = N * (K + L);
+  const numSamples = dim + 2; // need even number >= dim for Box-Muller pairs
+  const samples = new Float64Array(numSamples);
+
+  // Use SHAKE256 as deterministic RNG
+  const h = shake256.create({});
+  h.update(new Uint8Array([0x48])); // domain separator 'H'
+  h.update(rhop);
+  const iv = new Uint8Array(2);
+  iv[0] = nonce & 0xff;
+  iv[1] = (nonce >> 8) & 0xff;
+  h.update(iv);
+
+  const byteBuf = new Uint8Array(numSamples * 8);
+  h.xofInto(byteBuf);
+
+  // Box-Muller transform + L2 norm accumulation
+  let sq = 0;
+  const dv = new DataView(byteBuf.buffer, byteBuf.byteOffset, byteBuf.byteLength);
+  for (let i = 0; i < numSamples; i += 2) {
+    // Convert 64-bit random to uniform float in [0, 1) using top 53 bits.
+    // BigInt >> 11 extracts exactly 53 bits (fits in Number.MAX_SAFE_INTEGER),
+    // then multiply by 2^-53 to scale to [0, 1). This avoids double-rounding
+    // from Number(uint64) / 2^64 where the numerator exceeds 53-bit precision.
+    const u1 = dv.getBigUint64(i * 8, true);
+    const u2 = dv.getBigUint64((i + 1) * 8, true);
+    const TWO_NEG_53 = 1.1102230246251565e-16; // 2 ** -53, exact in float64
+    const f1Raw = Number(u1 >> 11n) * TWO_NEG_53; // [0, 1 - 2^-53]
+    const f2 = Number(u2 >> 11n) * TWO_NEG_53;
+    // C1 fix: clamp f1 > 0 to avoid log(0) = -Inf → NaN. Probability: 2^-53.
+    const f1 = f1Raw === 0 ? Number.MIN_VALUE : f1Raw;
+
+    // Box-Muller
+    const r = Math.sqrt(-2 * Math.log(f1));
+    const theta = 2 * Math.PI * f2;
+    const z1 = r * Math.cos(theta);
+    const z2 = r * Math.sin(theta);
+
+    // Accumulate L2 norm BEFORE nu scaling (matches Go reference exactly:
+    // Go accumulates sq from unscaled values, including the extra pair beyond dim)
+    samples[i] = z1;
+    sq += z1 * z1;
+    samples[i + 1] = z2;
+    sq += z2 * z2;
+
+    // Scale L-dimension components by nu AFTER sq accumulation
+    if (i < N * L) {
+      samples[i] *= nu;
+      if (i + 1 < N * L) samples[i + 1] *= nu;
+    }
+  }
+
+  // Normalize to sphere of radius rPrime
+  const result = new Float64Array(dim);
+  const factor = rPrime / Math.sqrt(sq);
+  for (let i = 0; i < dim; i++) {
+    result[i] = samples[i] * factor;
+  }
+
+  return result;
+}
+
+/** Add two FVecs. */
+function fvecAdd(a: Float64Array, b: Float64Array): Float64Array {
+  const r = new Float64Array(a.length);
+  for (let i = 0; i < a.length; i++) r[i] = a[i] + b[i];
+  return r;
+}
+
+/** Check if weighted L2 norm exceeds bound r. */
+function fvecExcess(v: Float64Array, r: number, nu: number, K: number, L: number): boolean {
+  let sq = 0;
+  for (let i = 0; i < L + K; i++) {
+    for (let j = 0; j < N; j++) {
+      const val = v[i * N + j];
+      if (i < L) {
+        sq += (val * val) / (nu * nu);
+      } else {
+        sq += val * val;
+      }
+    }
+  }
+  return sq > r * r;
+}
+
+/** Convert integer vectors (s1,s2) to FVec with centered mod Q. */
+function fvecFrom(
+  s1: readonly Int32Array[],
+  s2: readonly Int32Array[],
+  K: number,
+  L: number
+): Float64Array {
+  const result = new Float64Array(N * (K + L));
+  for (let i = 0; i < L + K; i++) {
+    for (let j = 0; j < N; j++) {
+      let u: number;
+      if (i < L) {
+        u = s1[i][j] | 0;
+      } else {
+        u = s2[i - L][j] | 0;
+      }
+      // Center mod Q: smod equivalent
+      u = ((u + ((Q - 1) / 2)) | 0) % Q;
+      if (u < 0) u += Q;
+      u = u - ((Q - 1) / 2);
+      result[i * N + j] = u;
+    }
+  }
+  return result;
+}
+
+/** Round FVec back to integer vectors. */
+function fvecRound(
+  v: Float64Array,
+  K: number,
+  L: number
+): { z: Int32Array[]; e: Int32Array[] } {
+  const z: Int32Array[] = [];
+  const e: Int32Array[] = [];
+  for (let i = 0; i < L; i++) z.push(new Int32Array(N));
+  for (let i = 0; i < K; i++) e.push(new Int32Array(N));
+
+  for (let i = 0; i < L + K; i++) {
+    for (let j = 0; j < N; j++) {
+      let u = Math.round(v[i * N + j]) | 0;
+      // Add Q if negative
+      if (u < 0) u += Q;
+      if (i < L) {
+        z[i][j] = u;
+      } else {
+        e[i - L][j] = u;
+      }
+    }
+  }
+  return { z, e };
+}
+
+// ==================== ThresholdMLDSA Class ====================
+
+/**
+ * Threshold ML-DSA signing protocol.
+ *
+ * Implements FIPS 204 compliant t-of-n threshold signing
+ * producing standard ML-DSA signatures. Based on the
+ * "Threshold Signatures Reloaded" construction.
+ */
+export class ThresholdMLDSA {
+  static readonly MAX_PARTIES = 6;
+
+  readonly #primitives: MLDSAPrimitives;
+  readonly params: ThresholdParams;
+
+  constructor(primitives: MLDSAPrimitives, params: ThresholdParams) {
+    this.#primitives = primitives;
+    this.params = params;
+  }
+
+  /**
+   * Create a ThresholdMLDSA instance for the given security level and threshold parameters.
+   * @param securityLevel - 44, 65, or 87 (or 128, 192, 256)
+   * @param T - Minimum number of parties needed to sign
+   * @param N_ - Total number of parties
+   */
+  static create(securityLevel: number, T: number, N_: number): ThresholdMLDSA {
+    const params = ThresholdMLDSA.getParams(T, N_, securityLevel);
+    const opts = getDSAOpts(securityLevel);
+    const primitives = createMLDSAPrimitives(opts);
+    return new ThresholdMLDSA(primitives, params);
+  }
+
+  /** Get threshold parameters for given (T, N, securityLevel). */
+  static getParams(T: number, N_: number, securityLevel: number): ThresholdParams {
+    const level = normalizeSecurityLevel(securityLevel);
+    const table = ALL_PARAMS[level];
+    if (!table) throw new Error(`Unsupported security level: ${securityLevel}`);
+    if (T < 2) throw new Error('Threshold T must be >= 2');
+    if (T > N_) throw new Error('Threshold T must be <= N');
+    if (N_ > ThresholdMLDSA.MAX_PARTIES) throw new Error(`N must be <= ${ThresholdMLDSA.MAX_PARTIES}`);
+    if (N_ < 2) throw new Error('N must be >= 2');
+
+    const entries = table[String(N_)];
+    if (!entries) throw new Error(`No parameters for N=${N_}`);
+    const idx = T - 2;
+    if (idx < 0 || idx >= entries.length) throw new Error(`No parameters for T=${T}, N=${N_}`);
+
+    const [K_iter, r, rPrime] = entries[idx];
+    return { T, N: N_, K_iter, nu: 3.0, r, rPrime };
+  }
+
+  /** Generate threshold keys from a seed. */
+  keygen(seed?: Uint8Array): ThresholdKeygenResult {
+    const p = this.#primitives;
+    const { K, L, TR_BYTES, ETA } = p;
+    const params = this.params;
+
+    if (seed === undefined) seed = randomBytes(32);
+    abytes(seed, 32, 'seed');
+
+    const h = shake256.create({});
+    h.update(seed);
+    // NIST mode: append K, L
+    h.update(new Uint8Array([K, L]));
+
+    // Derive rho (32 bytes)
+    const rho = new Uint8Array(32);
+    h.xofInto(rho);
+
+    // Expand A matrix
+    const xof = p.XOF128(rho);
+    const A: Int32Array[][] = [];
+    for (let i = 0; i < K; i++) {
+      const row: Int32Array[] = [];
+      for (let j = 0; j < L; j++) row.push(p.RejNTTPoly(xof.get(j, i)));
+      A.push(row);
+    }
+    xof.clean();
+
+    // Initialize per-party keys
+    const sks: {
+      id: number;
+      rho: Uint8Array;
+      key: Uint8Array;
+      shares: Map<number, SecretShare>;
+    }[] = [];
+    for (let i = 0; i < params.N; i++) {
+      const key = new Uint8Array(32);
+      h.xofInto(key);
+      sks.push({
+        id: i,
+        rho: rho.slice(),
+        key,
+        shares: new Map(),
+      });
+    }
+
+    // Accumulate total secret
+    const totalS1: Int32Array[] = [];
+    const totalS2: Int32Array[] = [];
+    const totalS1Hat: Int32Array[] = [];
+    const totalS2Hat: Int32Array[] = [];
+    for (let i = 0; i < L; i++) {
+      totalS1.push(new Int32Array(N));
+      totalS1Hat.push(new Int32Array(N));
+    }
+    for (let i = 0; i < K; i++) {
+      totalS2.push(new Int32Array(N));
+      totalS2Hat.push(new Int32Array(N));
+    }
+
+    // Gosper's hack: iterate all bitmasks with exactly (N-T+1) bits set among N bits
+    let honestSigners = (1 << (params.N - params.T + 1)) - 1;
+    while (honestSigners < (1 << params.N)) {
+      // Sample share seed
+      const sSeed = new Uint8Array(64);
+      h.xofInto(sSeed);
+
+      // Sample s1, s2 for this share using PolyDeriveUniformLeqEta equivalent
+      const shareS1: Int32Array[] = [];
+      const shareS2: Int32Array[] = [];
+      for (let j = 0; j < L; j++) {
+        shareS1.push(this.#deriveUniformLeqEta(sSeed, j));
+      }
+      for (let j = 0; j < K; j++) {
+        shareS2.push(this.#deriveUniformLeqEta(sSeed, j + L));
+      }
+
+      // Compute NTT representations
+      const shareS1Hat = shareS1.map((s) => p.NTT.encode(s.slice()));
+      const shareS2Hat = shareS2.map((s) => p.NTT.encode(s.slice()));
+
+      const share: SecretShare = {
+        s1: shareS1,
+        s2: shareS2,
+        s1Hat: shareS1Hat,
+        s2Hat: shareS2Hat,
+      };
+
+      // Distribute share to parties whose bit is set
+      for (let i = 0; i < params.N; i++) {
+        if ((honestSigners & (1 << i)) !== 0) {
+          sks[i].shares.set(honestSigners, share);
+        }
+      }
+
+      // Accumulate total
+      for (let j = 0; j < L; j++) {
+        p.polyAdd(totalS1[j], shareS1[j]);
+        p.polyAdd(totalS1Hat[j], shareS1Hat[j]);
+      }
+      for (let j = 0; j < K; j++) {
+        p.polyAdd(totalS2[j], shareS2[j]);
+        p.polyAdd(totalS2Hat[j], shareS2Hat[j]);
+      }
+
+      // Gosper's hack: next combination
+      const c = honestSigners & -honestSigners;
+      const r = honestSigners + c;
+      honestSigners = (((r ^ honestSigners) >> 2) / c) | r;
+    }
+
+    // Normalize total secrets
+    for (let j = 0; j < L; j++) {
+      for (let i = 0; i < N; i++) totalS1[j][i] = p.mod(totalS1[j][i]);
+      for (let i = 0; i < N; i++) totalS1Hat[j][i] = p.mod(totalS1Hat[j][i]);
+    }
+    for (let j = 0; j < K; j++) {
+      for (let i = 0; i < N; i++) totalS2[j][i] = p.mod(totalS2[j][i]);
+      for (let i = 0; i < N; i++) totalS2Hat[j][i] = p.mod(totalS2Hat[j][i]);
+    }
+
+    // Compute t = A*s1 + s2, then Power2Round to get (t0, t1)
+    const t1: Int32Array[] = [];
+    for (let i = 0; i < K; i++) {
+      const t = p.newPoly(N);
+      for (let j = 0; j < L; j++) {
+        p.polyAdd(t, p.MultiplyNTTs(A[i][j], totalS1Hat[j]));
+      }
+      p.NTT.decode(t);
+      p.polyAdd(t, totalS2[i]);
+      // Normalize t
+      for (let c = 0; c < N; c++) t[c] = p.mod(t[c]);
+      const { r1 } = p.polyPowerRound(t);
+      t1.push(r1);
+    }
+
+    // Encode public key
+    const publicKey = p.publicCoder.encode([rho, t1]);
+
+    // Compute tr = H(pk)
+    const tr = shake256(publicKey, { dkLen: TR_BYTES });
+
+    // Finalize shares
+    const shares: ThresholdKeyShare[] = sks.map((sk) => ({
+      id: sk.id,
+      rho: sk.rho,
+      key: sk.key,
+      tr: tr.slice(),
+      shares: sk.shares,
+    }));
+
+    return { publicKey, shares };
+  }
+
+  /**
+   * Full threshold signing protocol (convenience method for local signing).
+   * @param msg - Message to sign
+   * @param publicKey - The threshold public key
+   * @param shares - At least T threshold key shares
+   * @param opts - Optional context
+   */
+  sign(
+    msg: Uint8Array,
+    publicKey: Uint8Array,
+    shares: readonly ThresholdKeyShare[],
+    opts?: { readonly context?: Uint8Array }
+  ): Uint8Array {
+    const p = this.#primitives;
+    const params = this.params;
+    const ctx = opts?.context ?? new Uint8Array(0);
+
+    if (shares.length < params.T) {
+      throw new Error(`Need at least ${params.T} shares, got ${shares.length}`);
+    }
+    abytes(publicKey, p.publicCoder.bytesLen, 'publicKey');
+    abytes(msg);
+
+    // Use first T shares
+    const activeShares = shares.slice(0, params.T);
+
+    // Compute the active signer bitmask and validate unique IDs
+    let act = 0;
+    for (const share of activeShares) {
+      const bit = 1 << share.id;
+      if (act & bit) throw new Error(`Duplicate share ID: ${share.id}`);
+      act |= bit;
+    }
+
+    // Compute mu = H(tr || M) where M = getMessage(msg, ctx)
+    const M = getMessage(msg, ctx);
+    const mu = shake256.create({ dkLen: p.CRH_BYTES }).update(activeShares[0].tr).update(M).digest();
+
+    // Main rejection loop
+    for (let attempt = 0; attempt < 500; attempt++) {
+      // Generate random rhop per party
+      const rhops = activeShares.map(() => randomBytes(64));
+
+      // Round 1: Generate commitments
+      const allWs: Int32Array[][][] = []; // [party][iter][poly_k]
+      const allStws: Float64Array[][] = []; // [party][iter]
+      for (let pi = 0; pi < activeShares.length; pi++) {
+        const { ws, stws } = this.#genCommitment(activeShares[pi], rhops[pi], attempt, params);
+        allWs.push(ws);
+        allStws.push(stws);
+      }
+
+      // Aggregate commitments
+      const wfinals = this.#aggregateCommitments(allWs, params);
+
+      // Compute responses per party
+      const allZs: Int32Array[][][] = []; // [party][iter][poly_l]
+      for (let pi = 0; pi < activeShares.length; pi++) {
+        const zs = this.#computeResponses(
+          activeShares[pi],
+          act,
+          mu,
+          wfinals,
+          allStws[pi],
+          params
+        );
+        allZs.push(zs);
+      }
+
+      // Aggregate responses
+      const zfinals = this.#aggregateResponses(allZs, params);
+
+      // Combine into signature
+      const sig = this.#combine(publicKey, mu, wfinals, zfinals, params);
+      if (sig !== null) {
+        // H6 fix: zero secret material after successful signing
+        for (const stws of allStws) for (const stw of stws) stw.fill(0);
+        for (const zs of allZs) for (const z of zs) cleanBytes(z);
+        mu.fill(0);
+        return sig;
+      }
+    }
+
+    // H6 fix: zero secret material on failure path too
+    mu.fill(0);
+    throw new Error('Failed to produce valid threshold signature after 500 attempts');
+  }
+
+  // ==================== Private Methods ====================
+
+  /** Derive a polynomial with coefficients in [-eta, eta] from seed and nonce. */
+  #deriveUniformLeqEta(seed: Uint8Array, nonce: number): Int32Array {
+    const p = this.#primitives;
+    // Use SHAKE256 as in Go: PolyDeriveUniformLeqEta
+    const iv = new Uint8Array(66);
+    iv.set(seed.subarray(0, 64));
+    iv[64] = nonce & 0xff;
+    iv[65] = (nonce >> 8) & 0xff;
+
+    const h = shake256.create({}).update(iv);
+    const buf = new Uint8Array(136); // SHAKE-256 rate
+    const poly = p.newPoly(N);
+    let j = 0;
+    while (j < N) {
+      h.xofInto(buf);
+      for (let i = 0; j < N && i < 136; i++) {
+        const t1 = buf[i] & 15;
+        const t2 = buf[i] >> 4;
+        if (p.ETA === 2) {
+          if (t1 <= 14) {
+            poly[j++] = p.mod(Q + p.ETA - (t1 - Math.floor((205 * t1) >> 10) * 5));
+          }
+          if (j < N && t2 <= 14) {
+            poly[j++] = p.mod(Q + p.ETA - (t2 - Math.floor((205 * t2) >> 10) * 5));
+          }
+        } else if (p.ETA === 4) {
+          if (t1 <= 2 * p.ETA) {
+            poly[j++] = p.mod(Q + p.ETA - t1);
+          }
+          if (j < N && t2 <= 2 * p.ETA) {
+            poly[j++] = p.mod(Q + p.ETA - t2);
+          }
+        }
+      }
+    }
+    return poly;
+  }
+
+  /** Recover the combined share for a given active set bitmask. */
+  #recoverShare(
+    share: ThresholdKeyShare,
+    act: number
+  ): { s1Hat: Int32Array[]; s2Hat: Int32Array[] } {
+    const p = this.#primitives;
+    const params = this.params;
+    const { K, L } = p;
+
+    // Base case: T=N, each party has exactly one share
+    if (params.T === params.N) {
+      for (const [, s] of share.shares) {
+        return {
+          s1Hat: s.s1Hat.map((x) => x.slice() as Int32Array),
+          s2Hat: s.s2Hat.map((x) => x.slice() as Int32Array),
+        };
+      }
+      throw new Error('No shares available');
+    }
+
+    const sharing = getSharingPattern(params.T, params.N);
+    if (!sharing) throw new Error(`No sharing pattern for T=${params.T}, N=${params.N}`);
+
+    // Build permutation mapping active set to reference pattern
+    const perm = new Uint8Array(params.N);
+    let i1 = 0;
+    let i2 = params.T;
+    let currenti = 0;
+    for (let j = 0; j < params.N; j++) {
+      if (j === share.id) currenti = i1;
+      if ((act & (1 << j)) !== 0) {
+        perm[i1++] = j;
+      } else {
+        perm[i2++] = j;
+      }
+    }
+
+    // Sum shares according to pattern
+    const s1Hat: Int32Array[] = [];
+    const s2Hat: Int32Array[] = [];
+    for (let i = 0; i < L; i++) s1Hat.push(new Int32Array(N));
+    for (let i = 0; i < K; i++) s2Hat.push(new Int32Array(N));
+
+    for (const u of sharing[currenti]) {
+      // Apply permutation to translate share index
+      let u_ = 0;
+      for (let i = 0; i < params.N; i++) {
+        if ((u & (1 << i)) !== 0) {
+          u_ |= 1 << perm[i];
+        }
+      }
+
+      const s = share.shares.get(u_);
+      if (!s) throw new Error(`Missing share for bitmask ${u_}`);
+
+      for (let j = 0; j < L; j++) p.polyAdd(s1Hat[j], s.s1Hat[j]);
+      for (let j = 0; j < K; j++) p.polyAdd(s2Hat[j], s.s2Hat[j]);
+    }
+
+    // Normalize
+    for (let j = 0; j < L; j++)
+      for (let i = 0; i < N; i++) s1Hat[j][i] = p.mod(s1Hat[j][i]);
+    for (let j = 0; j < K; j++)
+      for (let i = 0; i < N; i++) s2Hat[j][i] = p.mod(s2Hat[j][i]);
+
+    return { s1Hat, s2Hat };
+  }
+
+  /** Generate K_iter commitments for a party. */
+  #genCommitment(
+    share: ThresholdKeyShare,
+    rhop: Uint8Array,
+    nonce: number,
+    params: ThresholdParams
+  ): { ws: Int32Array[][]; stws: Float64Array[] } {
+    const p = this.#primitives;
+    const { K, L } = p;
+
+    // Expand A
+    const xof = p.XOF128(share.rho);
+    const A: Int32Array[][] = [];
+    for (let i = 0; i < K; i++) {
+      const row: Int32Array[] = [];
+      for (let j = 0; j < L; j++) row.push(p.RejNTTPoly(xof.get(j, i)));
+      A.push(row);
+    }
+    xof.clean();
+
+    const ws: Int32Array[][] = [];
+    const stws: Float64Array[] = [];
+
+    for (let iter = 0; iter < params.K_iter; iter++) {
+      // Sample hyperball
+      const stw = sampleHyperball(params.rPrime, params.nu, K, L, rhop, nonce * params.K_iter + iter);
+      stws.push(stw);
+
+      // Round to (y, e)
+      const { z: y, e } = fvecRound(stw, K, L);
+
+      // w = A*NTT(y) + e (in normal domain)
+      const yHat = y.map((s) => p.NTT.encode(s.slice()));
+      const w: Int32Array[] = [];
+      for (let i = 0; i < K; i++) {
+        const wi = p.newPoly(N);
+        for (let j = 0; j < L; j++) {
+          p.polyAdd(wi, p.MultiplyNTTs(A[i][j], yHat[j]));
+        }
+        // Reduce and InvNTT
+        for (let c = 0; c < N; c++) wi[c] = p.mod(wi[c]);
+        p.NTT.decode(wi);
+        // Add error
+        p.polyAdd(wi, e[i]);
+        // Normalize
+        for (let c = 0; c < N; c++) wi[c] = p.mod(wi[c]);
+        w.push(wi);
+      }
+
+      ws.push(w);
+    }
+
+    return { ws, stws };
+  }
+
+  /** Aggregate commitments from all parties. */
+  #aggregateCommitments(
+    allWs: Int32Array[][][],
+    params: ThresholdParams
+  ): Int32Array[][] {
+    const p = this.#primitives;
+    const { K } = p;
+    const wfinals: Int32Array[][] = [];
+
+    for (let iter = 0; iter < params.K_iter; iter++) {
+      const wf: Int32Array[] = [];
+      for (let j = 0; j < K; j++) {
+        const w = p.newPoly(N);
+        for (let pi = 0; pi < allWs.length; pi++) {
+          p.polyAdd(w, allWs[pi][iter][j]);
+        }
+        for (let c = 0; c < N; c++) w[c] = p.mod(w[c]);
+        wf.push(w);
+      }
+      wfinals.push(wf);
+    }
+
+    return wfinals;
+  }
+
+  /** Compute responses for a party. */
+  #computeResponses(
+    share: ThresholdKeyShare,
+    act: number,
+    mu: Uint8Array,
+    wfinals: Int32Array[][],
+    stws: Float64Array[],
+    params: ThresholdParams
+  ): Int32Array[][] {
+    const p = this.#primitives;
+    const { K, L } = p;
+
+    const { s1Hat, s2Hat } = this.#recoverShare(share, act);
+
+    const zs: Int32Array[][] = [];
+
+    for (let iter = 0; iter < params.K_iter; iter++) {
+      // Decompose wfinal into (w0, w1)
+      const w1: Int32Array[] = [];
+      for (let j = 0; j < K; j++) {
+        w1.push(Int32Array.from(wfinals[iter][j].map(p.HighBits)));
+      }
+
+      // c_tilde = H(mu || W1Vec.encode(w1))
+      const cTilde = shake256
+        .create({ dkLen: p.C_TILDE_BYTES })
+        .update(mu)
+        .update(p.W1Vec.encode(w1))
+        .digest();
+
+      // c = SampleInBall(c_tilde), then NTT
+      const cHat = p.NTT.encode(p.SampleInBall(cTilde));
+
+      // Compute c*s1 in NTT domain, then InvNTT
+      const cs1: Int32Array[] = [];
+      for (let j = 0; j < L; j++) {
+        const t = p.MultiplyNTTs(cHat, s1Hat[j]);
+        p.NTT.decode(t);
+        // Normalize
+        for (let c = 0; c < N; c++) t[c] = p.mod(t[c]);
+        cs1.push(t);
+      }
+
+      // Compute c*s2 in NTT domain, then InvNTT
+      const cs2: Int32Array[] = [];
+      for (let j = 0; j < K; j++) {
+        const t = p.MultiplyNTTs(cHat, s2Hat[j]);
+        p.NTT.decode(t);
+        for (let c = 0; c < N; c++) t[c] = p.mod(t[c]);
+        cs2.push(t);
+      }
+
+      // Convert to FVec and add hyperball state
+      const csVec = fvecFrom(cs1, cs2, K, L);
+      const zf = fvecAdd(csVec, stws[iter]);
+
+      // H1 fix: always execute Round() to avoid timing leak from
+      // the acceptance pattern correlating with the secret key.
+      const excess = fvecExcess(zf, params.r, params.nu, K, L);
+      const { z } = fvecRound(zf, K, L);
+
+      if (excess) {
+        // Reject this iteration — push zero vector
+        const zeroZ: Int32Array[] = [];
+        for (let j = 0; j < L; j++) zeroZ.push(new Int32Array(N));
+        zs.push(zeroZ);
+      } else {
+        zs.push(z);
+      }
+
+      // H6 fix: zero intermediate secret values
+      csVec.fill(0);
+      zf.fill(0);
+      cleanBytes(cs1, cs2);
+    }
+
+    // H6 fix: zero recovered share
+    cleanBytes(s1Hat, s2Hat);
+
+    return zs;
+  }
+
+  /** Aggregate responses from all parties. */
+  #aggregateResponses(
+    allZs: Int32Array[][][],
+    params: ThresholdParams
+  ): Int32Array[][] {
+    const p = this.#primitives;
+    const { L } = p;
+    const zfinals: Int32Array[][] = [];
+
+    for (let iter = 0; iter < params.K_iter; iter++) {
+      const zf: Int32Array[] = [];
+      for (let j = 0; j < L; j++) {
+        const z = p.newPoly(N);
+        for (let pi = 0; pi < allZs.length; pi++) {
+          p.polyAdd(z, allZs[pi][iter][j]);
+        }
+        for (let c = 0; c < N; c++) z[c] = p.mod(z[c]);
+        zf.push(z);
+      }
+      zfinals.push(zf);
+    }
+
+    return zfinals;
+  }
+
+  /** Combine aggregated commitments and responses into a standard FIPS 204 signature. */
+  #combine(
+    publicKey: Uint8Array,
+    mu: Uint8Array,
+    wfinals: Int32Array[][],
+    zfinals: Int32Array[][],
+    params: ThresholdParams
+  ): Uint8Array | null {
+    const p = this.#primitives;
+    const { K, L, GAMMA1, GAMMA2, BETA, OMEGA } = p;
+
+    // Decode public key to get (rho, t1)
+    const [rho, t1] = p.publicCoder.decode(publicKey);
+
+    // Expand A from rho
+    const xof = p.XOF128(rho);
+    const A: Int32Array[][] = [];
+    for (let i = 0; i < K; i++) {
+      const row: Int32Array[] = [];
+      for (let j = 0; j < L; j++) row.push(p.RejNTTPoly(xof.get(j, i)));
+      A.push(row);
+    }
+    xof.clean();
+
+    for (let iter = 0; iter < params.K_iter; iter++) {
+      const z = zfinals[iter];
+
+      // Check ||z||∞ < γ1 - β
+      let exceeds = false;
+      for (let j = 0; j < L; j++) {
+        if (p.polyChknorm(z[j], GAMMA1 - BETA)) {
+          exceeds = true;
+          break;
+        }
+      }
+      if (exceeds) continue;
+
+      // Decompose wfinal into (w0, w1)
+      const w0: Int32Array[] = [];
+      const w1: Int32Array[] = [];
+      for (let j = 0; j < K; j++) {
+        const w0j = p.newPoly(N);
+        const w1j = p.newPoly(N);
+        for (let c = 0; c < N; c++) {
+          const d = p.decompose(wfinals[iter][j][c]);
+          w0j[c] = d.r0;
+          w1j[c] = d.r1;
+        }
+        w0.push(w0j);
+        w1.push(w1j);
+      }
+
+      // c_tilde = H(mu || W1Vec.encode(w1))
+      const cTilde = shake256
+        .create({ dkLen: p.C_TILDE_BYTES })
+        .update(mu)
+        .update(p.W1Vec.encode(w1))
+        .digest();
+
+      // c = SampleInBall(c_tilde), then NTT
+      const cHat = p.NTT.encode(p.SampleInBall(cTilde));
+
+      // Compute Az in NTT domain
+      const zNtt = z.map((s) => p.NTT.encode(s.slice()));
+      const Az: Int32Array[] = [];
+      for (let i = 0; i < K; i++) {
+        const azi = p.newPoly(N);
+        for (let j = 0; j < L; j++) {
+          p.polyAdd(azi, p.MultiplyNTTs(A[i][j], zNtt[j]));
+        }
+        Az.push(azi);
+      }
+
+      // Compute Az - 2^d * c * t1 (matching Go: Az2dct1 = Az - NTT(c * t1 * 2^d))
+      // For each polynomial: ct12d = MultiplyNTTs(NTT(polyShiftl(t1[i])), cHat)
+      // Then subtract from Az and decode
+      const result: Int32Array[] = [];
+      for (let i = 0; i < K; i++) {
+        const ct12d = p.MultiplyNTTs(p.NTT.encode(p.polyShiftl(t1[i].slice() as Int32Array)), cHat);
+        result.push(p.NTT.decode(p.polySub(Az[i], ct12d)));
+      }
+
+      // Normalize result
+      for (let i = 0; i < K; i++) {
+        for (let c = 0; c < N; c++) result[i][c] = p.mod(result[i][c]);
+      }
+
+      // f = (Az - 2^d*c*t1)_decoded - wfinal
+      const f: Int32Array[] = [];
+      for (let j = 0; j < K; j++) {
+        const fj = p.newPoly(N);
+        for (let c = 0; c < N; c++) {
+          fj[c] = p.mod(result[j][c] - wfinals[iter][j][c]);
+        }
+        f.push(fj);
+      }
+
+      // Check ||f||∞ < γ2
+      let fExceeds = false;
+      for (let j = 0; j < K; j++) {
+        if (p.polyChknorm(f[j], GAMMA2)) {
+          fExceeds = true;
+          break;
+        }
+      }
+      if (fExceeds) continue;
+
+      // Compute hint: MakeHint(w0 + f, w1)
+      const w0pf: Int32Array[] = [];
+      for (let j = 0; j < K; j++) {
+        const w0pfj = p.newPoly(N);
+        for (let c = 0; c < N; c++) {
+          w0pfj[c] = p.mod(w0[j][c] + f[j][c]);
+        }
+        w0pf.push(w0pfj);
+      }
+
+      let hintPop = 0;
+      const h: Int32Array[] = [];
+      for (let j = 0; j < K; j++) {
+        const { v, cnt } = p.polyMakeHint(w0pf[j], w1[j]);
+        h.push(v);
+        hintPop += cnt;
+      }
+
+      if (hintPop > OMEGA) continue;
+
+      // Pack signature: [c_tilde, z, h]
+      return p.sigCoder.encode([cTilde, z, h]);
+    }
+
+    return null;
+  }
+}

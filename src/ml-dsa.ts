@@ -11,7 +11,17 @@
 import { abool } from '@noble/curves/utils.js';
 import { shake256 } from '@noble/hashes/sha3.js';
 import type { CHash } from '@noble/hashes/utils.js';
-import { genCrystals, type XOF, XOF128, XOF256 } from './_crystals.ts';
+import { type XOF, XOF128, XOF256 } from './_crystals.ts';
+import {
+  createMLDSAPrimitives,
+  type MLDSAPrimitives,
+  type PrimitivesOpts,
+  D,
+  GAMMA2_1,
+  GAMMA2_2,
+  N,
+  Q,
+} from './ml-dsa-primitives.ts';
 import {
   abytes,
   type BytesCoderLen,
@@ -28,7 +38,6 @@ import {
   validateOpts,
   validateSigOpts,
   validateVerOpts,
-  vecCoder,
   type VerOpts,
 } from './utils.ts';
 
@@ -49,21 +58,7 @@ export type DSAInternal = CryptoKeys & {
     opts?: VerOpts & DSAInternalOpts
   ) => boolean;
 };
-export type DSA = Signer & { internal: DSAInternal };
-
-// Constants
-const N = 256;
-// 2**23 − 2**13 + 1, 23 bits: multiply will be 46. We have enough precision in JS to avoid bigints
-const Q = 8380417;
-const ROOT_OF_UNITY = 1753;
-// f = 256**−1 mod q, pow(256, -1, q) = 8347681 (python3)
-const F = 8347681;
-const D = 13;
-// Dilithium is kinda parametrized over GAMMA2, but everything will break with any other value.
-const GAMMA2_1 = Math.floor((Q - 1) / 88) | 0;
-const GAMMA2_2 = Math.floor((Q - 1) / 32) | 0;
-
-type XofGet = ReturnType<ReturnType<XOF>['get']>;
+export type DSA = Signer & { internal: DSAInternal; primitives: MLDSAPrimitives };
 
 /** Various lattice params. */
 export type DSAParam = {
@@ -84,277 +79,38 @@ export const PARAMS: Record<string, DSAParam> = {
   5: { K: 8, L: 7, D, GAMMA1: 2 ** 19, GAMMA2: GAMMA2_2, TAU: 60, ETA: 2, OMEGA: 75 },
 } as const;
 
-// NOTE: there is a lot cases where negative numbers used (with smod instead of mod).
-type Poly = Int32Array;
-const newPoly = (n: number): Int32Array => new Int32Array(n);
-
-const { mod, smod, NTT, bitsCoder } = genCrystals({
-  N,
-  Q,
-  F,
-  ROOT_OF_UNITY,
-  newPoly,
-  isKyber: false,
-  brvBits: 8,
-});
-
-const id = <T>(n: T): T => n;
-type IdNum = (n: number) => number;
-
-const polyCoder = (d: number, compress: IdNum = id, verify: IdNum = id) =>
-  bitsCoder(d, {
-    encode: (i: number) => compress(verify(i)),
-    decode: (i: number) => verify(compress(i)),
-  });
-
-const polyAdd = (a: Poly, b: Poly) => {
-  for (let i = 0; i < a.length; i++) a[i] = mod(a[i] + b[i]);
-  return a;
-};
-const polySub = (a: Poly, b: Poly): Poly => {
-  for (let i = 0; i < a.length; i++) a[i] = mod(a[i] - b[i]);
-  return a;
-};
-
-const polyShiftl = (p: Poly): Poly => {
-  for (let i = 0; i < N; i++) p[i] <<= D;
-  return p;
-};
-
-const polyChknorm = (p: Poly, B: number): boolean => {
-  // Not very sure about this, but FIPS204 doesn't provide any function for that :(
-  for (let i = 0; i < N; i++) if (Math.abs(smod(p[i])) >= B) return true;
-  return false;
-};
-
-const MultiplyNTTs = (a: Poly, b: Poly): Poly => {
-  // NOTE: we don't use montgomery reduction in code, since it requires 64 bit ints,
-  // which is not available in JS. mod(a[i] * b[i]) is ok, since Q is 23 bit,
-  // which means a[i] * b[i] is 46 bit, which is safe to use in JS. (number is 53 bits).
-  // Barrett reduction is slower than mod :(
-  const c = newPoly(N);
-  for (let i = 0; i < a.length; i++) c[i] = mod(a[i] * b[i]);
-  return c;
-};
-
-// Return poly in NTT representation
-function RejNTTPoly(xof: XofGet) {
-  // Samples a polynomial ∈ Tq.
-  const r = newPoly(N);
-  // NOTE: we can represent 3xu24 as 4xu32, but it doesn't improve perf :(
-  for (let j = 0; j < N; ) {
-    const b = xof();
-    if (b.length % 3) throw new Error('RejNTTPoly: unaligned block');
-    for (let i = 0; j < N && i <= b.length - 3; i += 3) {
-      const t = (b[i + 0] | (b[i + 1] << 8) | (b[i + 2] << 16)) & 0x7fffff; // 3 bytes
-      if (t < Q) r[j++] = t;
-    }
-  }
-  return r;
-}
-
-type DilithiumOpts = {
-  K: number;
-  L: number;
-  GAMMA1: number;
-  GAMMA2: number;
-  TAU: number;
-  ETA: number;
-  OMEGA: number;
-  C_TILDE_BYTES: number;
-  CRH_BYTES: number;
-  TR_BYTES: number;
-  XOF128: XOF;
-  XOF256: XOF;
+type DilithiumOpts = PrimitivesOpts & {
   securityLevel: number;
 };
 
 function getDilithium(opts: DilithiumOpts) {
-  const { K, L, GAMMA1, GAMMA2, TAU, ETA, OMEGA } = opts;
-  const { CRH_BYTES, TR_BYTES, C_TILDE_BYTES, XOF128, XOF256, securityLevel } = opts;
-
-  if (![2, 4].includes(ETA)) throw new Error('Wrong ETA');
-  if (![1 << 17, 1 << 19].includes(GAMMA1)) throw new Error('Wrong GAMMA1');
-  if (![GAMMA2_1, GAMMA2_2].includes(GAMMA2)) throw new Error('Wrong GAMMA2');
-  const BETA = TAU * ETA;
-
-  const decompose = (r: number) => {
-    // Decomposes r into (r1, r0) such that r ≡ r1(2γ2) + r0 mod q.
-    const rPlus = mod(r);
-    const r0 = smod(rPlus, 2 * GAMMA2) | 0;
-    if (rPlus - r0 === Q - 1) return { r1: 0 | 0, r0: (r0 - 1) | 0 };
-    const r1 = Math.floor((rPlus - r0) / (2 * GAMMA2)) | 0;
-    return { r1, r0 }; // r1 = HighBits, r0 = LowBits
-  };
-
-  const HighBits = (r: number) => decompose(r).r1;
-  const LowBits = (r: number) => decompose(r).r0;
-  const MakeHint = (z: number, r: number) => {
-    // Compute hint bit indicating whether adding z to r alters the high bits of r.
-
-    // From dilithium code
-    const res0 = z <= GAMMA2 || z > Q - GAMMA2 || (z === Q - GAMMA2 && r === 0) ? 0 : 1;
-    // from FIPS204:
-    // // const r1 = HighBits(r);
-    // // const v1 = HighBits(r + z);
-    // // const res1 = +(r1 !== v1);
-    // But they return different results! However, decompose is same.
-    // So, either there is a bug in Dilithium ref implementation or in FIPS204.
-    // For now, lets use dilithium one, so test vectors can be passed.
-    // See
-    // https://github.com/GiacomoPope/dilithium-py?tab=readme-ov-file#optimising-decomposition-and-making-hints
-    return res0;
-  };
-
-  /*const MakeHint = (z: number, r: number) => {
-    const r1 = HighBits(r);
-    const v1 = HighBits(r + z);
-    return +(r1 !== v1);
-  };*/
-
-  const UseHint = (h: number, r: number) => {
-    // Returns the high bits of r adjusted according to hint h
-    const m = Math.floor((Q - 1) / (2 * GAMMA2));
-    const { r1, r0 } = decompose(r);
-    // 3: if h = 1 and r0 > 0 return (r1 + 1) mod m
-    // 4: if h = 1 and r0 ≤ 0 return (r1 − 1) mod m
-    if (h === 1) return r0 > 0 ? mod(r1 + 1, m) | 0 : mod(r1 - 1, m) | 0;
-    return r1 | 0;
-  };
-  const Power2Round = (r: number) => {
-    // Decomposes r into (r1, r0) such that r ≡ r1*(2**d) + r0 mod q.
-    const rPlus = mod(r);
-    const r0 = smod(rPlus, 2 ** D) | 0;
-    return { r1: Math.floor((rPlus - r0) / 2 ** D) | 0, r0 };
-  };
-
-  const hintCoder: BytesCoderLen<Poly[] | false> = {
-    bytesLen: OMEGA + K,
-    encode: (h: Poly[] | false) => {
-      if (h === false) throw new Error('hint.encode: hint is false'); // should never happen
-      const res = new Uint8Array(OMEGA + K);
-      for (let i = 0, k = 0; i < K; i++) {
-        for (let j = 0; j < N; j++) if (h[i][j] !== 0) res[k++] = j;
-        res[OMEGA + i] = k;
-      }
-      return res;
-    },
-    decode: (buf: Uint8Array) => {
-      const h = [];
-      let k = 0;
-      for (let i = 0; i < K; i++) {
-        const hi = newPoly(N);
-        if (buf[OMEGA + i] < k || buf[OMEGA + i] > OMEGA) return false;
-        for (let j = k; j < buf[OMEGA + i]; j++) {
-          if (j > k && buf[j] <= buf[j - 1]) return false;
-          hi[buf[j]] = 1;
-        }
-        k = buf[OMEGA + i];
-        h.push(hi);
-      }
-      for (let j = k; j < OMEGA; j++) if (buf[j] !== 0) return false;
-      return h;
-    },
-  };
-
-  const ETACoder = polyCoder(
-    ETA === 2 ? 3 : 4,
-    (i: number) => ETA - i,
-    (i: number) => {
-      if (!(-ETA <= i && i <= ETA))
-        throw new Error(`malformed key s1/s3 ${i} outside of ETA range [${-ETA}, ${ETA}]`);
-      return i;
-    }
-  );
-  const T0Coder = polyCoder(13, (i: number) => (1 << (D - 1)) - i);
-  const T1Coder = polyCoder(10);
-  // Requires smod. Need to fix!
-  const ZCoder = polyCoder(GAMMA1 === 1 << 17 ? 18 : 20, (i: number) => smod(GAMMA1 - i));
-  const W1Coder = polyCoder(GAMMA2 === GAMMA2_1 ? 6 : 4);
-  const W1Vec = vecCoder(W1Coder, K);
-  // Main structures
-  const publicCoder = splitCoder('publicKey', 32, vecCoder(T1Coder, K));
-  const secretCoder = splitCoder(
-    'secretKey',
-    32,
-    32,
-    TR_BYTES,
-    vecCoder(ETACoder, L),
-    vecCoder(ETACoder, K),
-    vecCoder(T0Coder, K)
-  );
-  const sigCoder = splitCoder('signature', C_TILDE_BYTES, vecCoder(ZCoder, L), hintCoder);
-  const CoefFromHalfByte =
-    ETA === 2
-      ? (n: number) => (n < 15 ? 2 - (n % 5) : false)
-      : (n: number) => (n < 9 ? 4 - n : false);
-
-  // Return poly in NTT representation
-  function RejBoundedPoly(xof: XofGet) {
-    // Samples an element a ∈ Rq with coeffcients in [−η, η] computed via rejection sampling from ρ.
-    const r: Poly = newPoly(N);
-    for (let j = 0; j < N; ) {
-      const b = xof();
-      for (let i = 0; j < N && i < b.length; i += 1) {
-        // half byte. Should be superfast with vector instructions. But very slow with js :(
-        const d1 = CoefFromHalfByte(b[i] & 0x0f);
-        const d2 = CoefFromHalfByte((b[i] >> 4) & 0x0f);
-        if (d1 !== false) r[j++] = d1;
-        if (j < N && d2 !== false) r[j++] = d2;
-      }
-    }
-    return r;
-  }
-
-  const SampleInBall = (seed: Uint8Array) => {
-    // Samples a polynomial c ∈ Rq with coeffcients from {−1, 0, 1} and Hamming weight τ
-    const pre = newPoly(N);
-    const s = shake256.create({}).update(seed);
-    const buf = new Uint8Array(shake256.blockLen);
-    s.xofInto(buf);
-    const masks = buf.slice(0, 8);
-    for (let i = N - TAU, pos = 8, maskPos = 0, maskBit = 0; i < N; i++) {
-      let b = i + 1;
-      for (; b > i; ) {
-        b = buf[pos++];
-        if (pos < shake256.blockLen) continue;
-        s.xofInto(buf);
-        pos = 0;
-      }
-      pre[i] = pre[b];
-      pre[b] = 1 - (((masks[maskPos] >> maskBit++) & 1) << 1);
-      if (maskBit >= 8) {
-        maskPos++;
-        maskBit = 0;
-      }
-    }
-    return pre;
-  };
-
-  const polyPowerRound = (p: Poly) => {
-    const res0 = newPoly(N);
-    const res1 = newPoly(N);
-    for (let i = 0; i < p.length; i++) {
-      const { r0, r1 } = Power2Round(p[i]);
-      res0[i] = r0;
-      res1[i] = r1;
-    }
-    return { r0: res0, r1: res1 };
-  };
-  const polyUseHint = (u: Poly, h: Poly): Poly => {
-    for (let i = 0; i < N; i++) u[i] = UseHint(h[i], u[i]);
-    return u;
-  };
-  const polyMakeHint = (a: Poly, b: Poly) => {
-    const v = newPoly(N);
-    let cnt = 0;
-    for (let i = 0; i < N; i++) {
-      const h = MakeHint(a[i], b[i]);
-      v[i] = h;
-      cnt += h;
-    }
-    return { v, cnt };
-  };
+  const p = createMLDSAPrimitives(opts);
+  const { K, L, GAMMA1, GAMMA2, BETA, OMEGA } = p;
+  const { CRH_BYTES, TR_BYTES, C_TILDE_BYTES, XOF128, XOF256 } = p;
+  const {
+    mod,
+    smod,
+    newPoly,
+    NTT,
+    polyAdd,
+    polySub,
+    polyShiftl,
+    polyChknorm,
+    MultiplyNTTs,
+    RejNTTPoly,
+    HighBits,
+    LowBits,
+    SampleInBall,
+    RejBoundedPoly,
+    polyPowerRound,
+    polyUseHint,
+    polyMakeHint,
+    W1Vec,
+    ZCoder,
+    publicCoder,
+    secretCoder,
+    sigCoder,
+  } = p;
 
   const signRandBytes = 32;
   const seedCoder = splitCoder('seed', 32, 64, 32);
@@ -409,9 +165,6 @@ function getDilithium(opts: DilithiumOpts) {
       const secretKey = secretCoder.encode([rho, K_, tr, s1, s2, t0]); // sk ← skEncode(ρ, K,tr, s1, s2, t0)
       xof.clean();
       xofPrime.clean();
-      // STATS
-      // Kyber512:  { calls: 4, xofs: 12 }, Kyber768: { calls: 9, xofs: 27 }, Kyber1024: { calls: 16, xofs: 48 }
-      // DSA44:    { calls: 24, xofs: 24 }, DSA65:    { calls: 41, xofs: 41 }, DSA87:    { calls: 71, xofs: 71 }
       cleanBytes(rho, rhoPrime, K_, s1, s2, s1Hat, t, t0, t1, tr, seedDst);
       return { publicKey, secretKey };
     },
@@ -419,7 +172,7 @@ function getDilithium(opts: DilithiumOpts) {
       const [rho, _K, _tr, s1, s2, _t0] = secretCoder.decode(secretKey); // (ρ, K,tr, s1, s2, t0) ← skDecode(sk)
       const xof = XOF128(rho);
       const s1Hat = s1.map((p) => NTT.encode(p.slice()));
-      const t1: Poly[] = [];
+      const t1: Int32Array[] = [];
       const tmp = newPoly(N);
       for (let i = 0; i < K; i++) {
         tmp.fill(0);
@@ -445,7 +198,7 @@ function getDilithium(opts: DilithiumOpts) {
       // since we re-use a lot of variables to computation.
       const [rho, _K, tr, s1, s2, t0] = secretCoder.decode(secretKey); // (ρ, K,tr, s1, s2, t0) ← skDecode(sk)
       // Cache matrix to avoid re-compute later
-      const A: Poly[][] = []; // A ← ExpandA(ρ)
+      const A: Int32Array[][] = []; // A ← ExpandA(ρ)
       const xof = XOF128(rho);
       for (let i = 0; i < K; i++) {
         const pv = [];
@@ -502,7 +255,7 @@ function getDilithium(opts: DilithiumOpts) {
           .update(mu)
           .update(W1Vec.encode(w1))
           .digest();
-        // Verifer’s challenge
+        // Verifer's challenge
         const cHat = NTT.encode(SampleInBall(cTilde)); // c ← SampleInBall(c˜1); cˆ ← NTT(c)
         // ⟨⟨cs1⟩⟩ ← NTT−1(cˆ◦ sˆ1)
         const cs1 = s1.map((i) => MultiplyNTTs(i, cHat));
@@ -510,7 +263,7 @@ function getDilithium(opts: DilithiumOpts) {
           polyAdd(NTT.decode(cs1[i]), y[i]); // z ← y + ⟨⟨cs1⟩⟩
           if (polyChknorm(cs1[i], GAMMA1 - BETA)) continue main_loop; // ||z||∞ ≥ γ1 − β
         }
-        // cs1 is now z (▷ Signer’s response)
+        // cs1 is now z (▷ Signer's response)
         let cnt = 0;
         const h = [];
         for (let i = 0; i < K; i++) {
@@ -520,12 +273,12 @@ function getDilithium(opts: DilithiumOpts) {
           const ct0 = NTT.decode(MultiplyNTTs(t0[i], cHat)); // ⟨⟨ct0⟩⟩ ← NTT−1(cˆ◦ tˆ0)
           if (polyChknorm(ct0, GAMMA2)) continue main_loop;
           polyAdd(r0, ct0);
-          // ▷ Signer’s hint
+          // ▷ Signer's hint
           const hint = polyMakeHint(r0, w1[i]); // h ← MakeHint(−⟨⟨ct0⟩⟩, w− ⟨⟨cs2⟩⟩ + ⟨⟨ct0⟩⟩)
           h.push(hint.v);
           cnt += hint.cnt;
         }
-        if (cnt > OMEGA) continue; // the number of 1’s in h is greater than ω
+        if (cnt > OMEGA) continue; // the number of 1's in h is greater than ω
         x256.clean();
         const res = sigCoder.encode([cTilde, cs1, h]); // σ ← sigEncode(c˜, z mod±q, h)
         // rho, _K, tr is subarray of secretKey, cannot clean.
@@ -548,13 +301,13 @@ function getDilithium(opts: DilithiumOpts) {
       const tr = shake256(publicKey, { dkLen: TR_BYTES }); // 6: tr ← H(BytesToBits(pk), 512)
 
       if (sig.length !== sigCoder.bytesLen) return false; // return false instead of exception
-      const [cTilde, z, h] = sigCoder.decode(sig); // (c˜, z, h) ← sigDecode(σ), ▷ Signer’s commitment hash c ˜, response z and hint
+      const [cTilde, z, h] = sigCoder.decode(sig); // (c˜, z, h) ← sigDecode(σ), ▷ Signer's commitment hash c ˜, response z and hint
       if (h === false) return false; // if h = ⊥ then return false
       for (let i = 0; i < L; i++) if (polyChknorm(z[i], GAMMA1 - BETA)) return false;
       const mu = externalMu
         ? msg
         : shake256.create({ dkLen: CRH_BYTES }).update(tr).update(msg).digest(); // 7: µ ← H(tr||M, 512)
-      // Compute verifer’s challenge from c˜
+      // Compute verifer's challenge from c˜
       const c = NTT.encode(SampleInBall(cTilde)); // c ← SampleInBall(c˜1)
       const zNtt = z.map((i) => i.slice()); // zNtt = NTT(z)
       for (let i = 0; i < L; i++) NTT.encode(zNtt[i]);
@@ -569,7 +322,7 @@ function getDilithium(opts: DilithiumOpts) {
         }
         // wApprox = A*z - c*t1 * (2**d)
         const wApprox = NTT.decode(polySub(Az, ct12d));
-        // Reconstruction of signer’s commitment
+        // Reconstruction of signer's commitment
         wTick1.push(polyUseHint(wApprox, h[i])); // w ′ ← UseHint(h, w'approx )
       }
       xof.clean();
@@ -580,7 +333,7 @@ function getDilithium(opts: DilithiumOpts) {
         .update(W1Vec.encode(wTick1))
         .digest();
       // Additional checks in FIPS-204:
-      // [[ ||z||∞ < γ1 − β ]] and [[c ˜ = c˜′]] and [[number of 1’s in h is ≤ ω]]
+      // [[ ||z||∞ < γ1 − β ]] and [[c ˜ = c˜′]] and [[number of 1's in h is ≤ ω]]
       for (const t of h) {
         const sum = t.reduce((acc, i) => acc + i, 0);
         if (!(sum <= OMEGA)) return false;
@@ -592,7 +345,8 @@ function getDilithium(opts: DilithiumOpts) {
   return {
     info: { type: 'ml-dsa' },
     internal,
-    securityLevel: securityLevel,
+    primitives: p,
+    securityLevel: opts.securityLevel,
     keygen: internal.keygen,
     lengths: internal.lengths,
     getPublicKey: internal.getPublicKey,
@@ -608,10 +362,10 @@ function getDilithium(opts: DilithiumOpts) {
       return internal.verify(sig, getMessage(msg, opts.context), publicKey);
     },
     prehash: (hash: CHash) => {
-      checkHash(hash, securityLevel);
+      checkHash(hash, opts.securityLevel);
       return {
         info: { type: 'hashml-dsa' },
-        securityLevel: securityLevel,
+        securityLevel: opts.securityLevel,
         lengths: internal.lengths,
         keygen: internal.keygen,
         getPublicKey: internal.getPublicKey,

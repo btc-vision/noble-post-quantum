@@ -37,8 +37,10 @@
     "./_crystals.js": "./_crystals.js",
     "./hybrid.js": "./hybrid.js",
     "./ml-dsa.js": "./ml-dsa.js",
+    "./ml-dsa-primitives.js": "./ml-dsa-primitives.js",
     "./ml-kem.js": "./ml-kem.js",
     "./slh-dsa.js": "./slh-dsa.js",
+    "./threshold-ml-dsa.js": "./threshold-ml-dsa.js",
     "./utils.js": "./utils.js"
   },
   "engines": {
