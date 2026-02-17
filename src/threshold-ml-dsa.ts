@@ -19,7 +19,7 @@ import {
   Q,
 } from './ml-dsa-primitives.ts';
 import { PARAMS } from './ml-dsa.ts';
-import { abytes, cleanBytes, getMessage, randomBytes } from './utils.ts';
+import { abytes, cleanBytes, equalBytes, getMessage, randomBytes } from './utils.ts';
 
 // ==================== Types & Interfaces ====================
 
@@ -67,6 +67,131 @@ export interface ThresholdKeygenResult {
   readonly publicKey: Uint8Array;
   /** Per-party key shares. */
   readonly shares: readonly ThresholdKeyShare[];
+}
+
+// ==================== DKG Constants & Helpers ====================
+
+const DKG_RHO_COMMIT = /* @__PURE__ */ new TextEncoder().encode('DKG-RHO-COMMIT');
+const DKG_BSEED_COMMIT = /* @__PURE__ */ new TextEncoder().encode('DKG-BSEED-COMMIT');
+const DKG_RHO_AGG = /* @__PURE__ */ new TextEncoder().encode('DKG-RHO-AGG');
+const DKG_GEN_ASSIGN = /* @__PURE__ */ new TextEncoder().encode('DKG-GEN-ASSIGN');
+const DKG_BSEED = /* @__PURE__ */ new TextEncoder().encode('DKG-BSEED');
+
+function encode_u8(v: number): Uint8Array {
+  return new Uint8Array([v & 0xff]);
+}
+
+function encode_u16le(v: number): Uint8Array {
+  return new Uint8Array([v & 0xff, (v >> 8) & 0xff]);
+}
+
+/** Fill polynomial with uniform random values in [0, Q). */
+function fillUniformModQ(poly: Int32Array): void {
+  let filled = 0;
+  while (filled < N) {
+    // Q/2^23 ≈ 0.999, so rejection rate < 0.1%
+    const needed = N - filled;
+    const bytes = randomBytes(needed * 3);
+    for (let i = 0; i + 2 < bytes.length && filled < N; i += 3) {
+      const val = (bytes[i] | (bytes[i + 1] << 8) | (bytes[i + 2] << 16)) & 0x7fffff;
+      if (val < Q) poly[filled++] = val;
+    }
+  }
+}
+
+/**
+ * Additively split a vector of K polynomials into N shares
+ * such that sum of all shares equals the input (mod Q).
+ * N-1 shares are uniform random; the residual goes to index `residualIdx`
+ * (which should be gen(b) — the generator keeps the non-random piece locally).
+ *
+ * IMPORTANT: wb coefficients MUST be normalized to [0, Q) before calling.
+ */
+function splitVectorK(wb: readonly Int32Array[], nParties: number, residualIdx: number): Int32Array[][] {
+  const K = wb.length;
+  const result: Int32Array[][] = new Array(nParties);
+
+  // Sample N-1 uniform random masks
+  for (let j = 0; j < nParties; j++) {
+    if (j === residualIdx) continue;
+    const mask: Int32Array[] = [];
+    for (let k = 0; k < K; k++) {
+      const poly = new Int32Array(N);
+      fillUniformModQ(poly);
+      mask.push(poly);
+    }
+    result[j] = mask;
+  }
+
+  // Compute residual: wb - sum of all other masks (mod Q)
+  const residual: Int32Array[] = [];
+  for (let k = 0; k < K; k++) {
+    const poly = new Int32Array(N);
+    for (let c = 0; c < N; c++) {
+      let val = wb[k][c];
+      for (let j = 0; j < nParties; j++) {
+        if (j === residualIdx) continue;
+        val -= result[j][k][c];
+      }
+      poly[c] = ((val % Q) + Q) % Q;
+    }
+    residual.push(poly);
+  }
+  result[residualIdx] = residual;
+  return result;
+}
+
+// ==================== DKG Types ====================
+
+export type SessionId = Uint8Array;
+
+export interface DKGSetupResult {
+  readonly bitmasks: readonly number[];
+  readonly holdersOf: ReadonlyMap<number, readonly number[]>;
+}
+
+export interface DKGPhase1Broadcast {
+  readonly partyId: number;
+  readonly rhoCommitment: Uint8Array;
+  readonly bitmaskCommitments: ReadonlyMap<number, Uint8Array>;
+}
+
+export interface DKGPhase1State {
+  readonly rho: Uint8Array;
+  readonly bitmaskEntropy: ReadonlyMap<number, Uint8Array>;
+}
+
+export interface DKGPhase2Broadcast {
+  readonly partyId: number;
+  readonly rho: Uint8Array;
+}
+
+export interface DKGPhase2Private {
+  readonly fromPartyId: number;
+  readonly bitmaskReveals: ReadonlyMap<number, Uint8Array>;
+}
+
+export interface DKGPhase3Private {
+  readonly fromGeneratorId: number;
+  readonly maskPieces: ReadonlyMap<number, Int32Array[]>;
+}
+
+export interface DKGPhase4Broadcast {
+  readonly partyId: number;
+  readonly aggregate: readonly Int32Array[];
+}
+
+export interface DKGResult {
+  readonly publicKey: Uint8Array;
+  readonly share: ThresholdKeyShare;
+}
+
+export interface DKGPhase2FinalizeResult {
+  readonly shares: ReadonlyMap<number, SecretShare>;
+  readonly generatorAssignment: ReadonlyMap<number, number>;
+  readonly rho: Uint8Array;
+  readonly privateToAll: ReadonlyMap<number, DKGPhase3Private>;
+  readonly ownMaskPieces: ReadonlyMap<number, readonly Int32Array[]>;
 }
 
 // ==================== Distributed Protocol Types ====================
@@ -984,6 +1109,421 @@ export class ThresholdMLDSA {
     const result = this.#combine(publicKey, mu, wfinals, zfinals, params);
     mu.fill(0);
     return result;
+  }
+
+  // ==================== Distributed Key Generation (DKG) ====================
+
+  /**
+   * Phase 0: Deterministic DKG setup.
+   * Enumerates all bitmasks and their holders for the given (T, N).
+   */
+  dkgSetup(sessionId: SessionId): DKGSetupResult {
+    abytes(sessionId, 32, 'sessionId');
+    const params = this.params;
+    const bitmasks: number[] = [];
+    const holdersOf = new Map<number, number[]>();
+
+    const bitsSet = params.N - params.T + 1;
+    let mask = (1 << bitsSet) - 1;
+    while (mask < (1 << params.N)) {
+      bitmasks.push(mask);
+      const holders: number[] = [];
+      for (let i = 0; i < params.N; i++) {
+        if (mask & (1 << i)) holders.push(i);
+      }
+      holdersOf.set(mask, holders);
+      const c = mask & -mask;
+      const r = mask + c;
+      mask = (((r ^ mask) >> 2) / c) | r;
+    }
+
+    return { bitmasks, holdersOf };
+  }
+
+  /**
+   * Phase 1: Generate commitments for all entropy.
+   *
+   * Each party samples rho_i and per-bitmask r_{i,b}, commits via SHAKE256,
+   * and broadcasts the commitments. State is kept private.
+   *
+   * @param partyId - This party's index (0-based)
+   * @param sessionId - 32-byte unique session identifier
+   * @param opts - Optional: provide deterministic entropy for testing
+   */
+  dkgPhase1(
+    partyId: number,
+    sessionId: SessionId,
+    opts?: { readonly rho?: Uint8Array; readonly bitmaskEntropy?: ReadonlyMap<number, Uint8Array> }
+  ): { broadcast: DKGPhase1Broadcast; state: DKGPhase1State } {
+    abytes(sessionId, 32, 'sessionId');
+    if (partyId < 0 || partyId >= this.params.N) throw new Error(`Invalid partyId: ${partyId}`);
+
+    const { bitmasks } = this.dkgSetup(sessionId);
+    const rho = opts?.rho?.slice() ?? randomBytes(32);
+
+    const rhoCommitment = shake256
+      .create({ dkLen: 32 })
+      .update(DKG_RHO_COMMIT)
+      .update(sessionId)
+      .update(encode_u8(partyId))
+      .update(rho)
+      .digest();
+
+    const bitmaskEntropy = new Map<number, Uint8Array>();
+    const bitmaskCommitments = new Map<number, Uint8Array>();
+
+    for (const b of bitmasks) {
+      if (!(b & (1 << partyId))) continue;
+      const r_ib = opts?.bitmaskEntropy?.get(b)?.slice() ?? randomBytes(32);
+      bitmaskEntropy.set(b, r_ib);
+      const commitment = shake256
+        .create({ dkLen: 32 })
+        .update(DKG_BSEED_COMMIT)
+        .update(sessionId)
+        .update(encode_u16le(b))
+        .update(encode_u8(partyId))
+        .update(r_ib)
+        .digest();
+      bitmaskCommitments.set(b, commitment);
+    }
+
+    return {
+      broadcast: { partyId, rhoCommitment, bitmaskCommitments },
+      state: { rho, bitmaskEntropy },
+    };
+  }
+
+  /**
+   * Phase 2: Reveal entropy and prepare private messages for fellow holders.
+   *
+   * After collecting all Phase 1 broadcasts, each party reveals their rho_i
+   * (broadcast) and sends r_{i,b} values to fellow holders (private).
+   */
+  dkgPhase2(
+    partyId: number,
+    sessionId: SessionId,
+    state: DKGPhase1State,
+    allPhase1: readonly DKGPhase1Broadcast[]
+  ): { broadcast: DKGPhase2Broadcast; privateToHolders: Map<number, DKGPhase2Private> } {
+    abytes(sessionId, 32, 'sessionId');
+    const params = this.params;
+    if (allPhase1.length !== params.N) {
+      throw new Error(`Expected ${params.N} Phase 1 broadcasts, got ${allPhase1.length}`);
+    }
+
+    const { bitmasks, holdersOf } = this.dkgSetup(sessionId);
+    const broadcast: DKGPhase2Broadcast = { partyId, rho: state.rho };
+    const privateToHolders = new Map<number, DKGPhase2Private>();
+
+    for (const b of bitmasks) {
+      if (!(b & (1 << partyId))) continue;
+      const holders = holdersOf.get(b)!;
+      const r_ib = state.bitmaskEntropy.get(b)!;
+
+      for (const j of holders) {
+        if (j === partyId) continue;
+        let msg = privateToHolders.get(j);
+        if (!msg) {
+          msg = { fromPartyId: partyId, bitmaskReveals: new Map<number, Uint8Array>() };
+          privateToHolders.set(j, msg);
+        }
+        (msg.bitmaskReveals as Map<number, Uint8Array>).set(b, r_ib);
+      }
+    }
+
+    return { broadcast, privateToHolders };
+  }
+
+  /**
+   * Phase 2 Finalize + Phase 3: Verify reveals, derive seeds/shares, generate masks.
+   *
+   * After receiving all Phase 2 broadcasts and private reveals:
+   * 1. Verifies all rho commitments (Phase 2a)
+   * 2. Verifies all bitmask seed commitments (Phase 2c)
+   * 3. Derives joint rho, A, and generator assignments (Phase 2d)
+   * 4. Derives bitmask seeds and shares (Phase 2e)
+   * 5. For bitmasks where this party is generator: computes w^b, splits into masks (Phase 3)
+   */
+  dkgPhase2Finalize(
+    partyId: number,
+    sessionId: SessionId,
+    state: DKGPhase1State,
+    allPhase1: readonly DKGPhase1Broadcast[],
+    allPhase2Broadcasts: readonly DKGPhase2Broadcast[],
+    receivedReveals: readonly DKGPhase2Private[]
+  ): DKGPhase2FinalizeResult {
+    const p = this.#primitives;
+    const { K, L } = p;
+    const params = this.params;
+    abytes(sessionId, 32, 'sessionId');
+    const { bitmasks, holdersOf } = this.dkgSetup(sessionId);
+
+    // Step 2a: Verify rho commitments
+    for (const ph2 of allPhase2Broadcasts) {
+      const ph1 = allPhase1.find((x) => x.partyId === ph2.partyId);
+      if (!ph1) throw new Error(`Missing Phase 1 broadcast for party ${ph2.partyId}`);
+      const expected = shake256
+        .create({ dkLen: 32 })
+        .update(DKG_RHO_COMMIT)
+        .update(sessionId)
+        .update(encode_u8(ph2.partyId))
+        .update(ph2.rho)
+        .digest();
+      if (!equalBytes(expected, ph1.rhoCommitment)) {
+        throw new Error(`Rho commitment mismatch for party ${ph2.partyId}`);
+      }
+    }
+
+    // Step 2c: Verify bitmask seed commitments
+    const revealsByParty = new Map<number, ReadonlyMap<number, Uint8Array>>();
+    for (const reveal of receivedReveals) {
+      revealsByParty.set(reveal.fromPartyId, reveal.bitmaskReveals);
+    }
+
+    for (const [fromId, reveals] of revealsByParty) {
+      const ph1 = allPhase1.find((x) => x.partyId === fromId);
+      if (!ph1) throw new Error(`Missing Phase 1 broadcast for party ${fromId}`);
+      for (const [b, r_ib] of reveals) {
+        const expected = shake256
+          .create({ dkLen: 32 })
+          .update(DKG_BSEED_COMMIT)
+          .update(sessionId)
+          .update(encode_u16le(b))
+          .update(encode_u8(fromId))
+          .update(r_ib)
+          .digest();
+        const committed = ph1.bitmaskCommitments.get(b);
+        if (!committed || !equalBytes(expected, committed)) {
+          throw new Error(`Bitmask seed commitment mismatch for party ${fromId}, bitmask ${b}`);
+        }
+      }
+    }
+
+    // Step 2d: Derive joint rho
+    const sortedBroadcasts = [...allPhase2Broadcasts].sort((a, b) => a.partyId - b.partyId);
+    const rhoHasher = shake256.create({ dkLen: 32 }).update(DKG_RHO_AGG).update(sessionId);
+    for (const ph2 of sortedBroadcasts) rhoHasher.update(ph2.rho);
+    const rho = rhoHasher.digest();
+
+    // Expand A from rho
+    const xof = p.XOF128(rho);
+    const A: Int32Array[][] = [];
+    for (let i = 0; i < K; i++) {
+      const row: Int32Array[] = [];
+      for (let j = 0; j < L; j++) row.push(p.RejNTTPoly(xof.get(j, i)));
+      A.push(row);
+    }
+    xof.clean();
+
+    // Generator assignment
+    const generatorAssignment = new Map<number, number>();
+    for (const b of bitmasks) {
+      const holders = holdersOf.get(b)!;
+      const gRaw = shake256
+        .create({ dkLen: 1 })
+        .update(DKG_GEN_ASSIGN)
+        .update(sessionId)
+        .update(rho)
+        .update(encode_u16le(b))
+        .digest();
+      generatorAssignment.set(b, holders[gRaw[0] % holders.length]);
+    }
+
+    // Step 2e: Derive bitmask seeds and shares
+    const shares = new Map<number, SecretShare>();
+
+    for (const b of bitmasks) {
+      if (!(b & (1 << partyId))) continue;
+      const holders = holdersOf.get(b)!;
+
+      // Build seed_b from sorted holder entropy
+      const seedHasher = shake256
+        .create({ dkLen: 64 })
+        .update(DKG_BSEED)
+        .update(sessionId)
+        .update(encode_u16le(b));
+      for (const h of holders) {
+        if (h === partyId) {
+          seedHasher.update(state.bitmaskEntropy.get(b)!);
+        } else {
+          const reveals = revealsByParty.get(h);
+          if (!reveals) throw new Error(`Missing reveals from party ${h}`);
+          const r_hb = reveals.get(b);
+          if (!r_hb) throw new Error(`Missing reveal for bitmask ${b} from party ${h}`);
+          seedHasher.update(r_hb);
+        }
+      }
+      const seedB = seedHasher.digest();
+
+      // Derive share
+      const s1: Int32Array[] = [];
+      const s2: Int32Array[] = [];
+      for (let j = 0; j < L; j++) s1.push(this.#deriveUniformLeqEta(seedB, j));
+      for (let j = 0; j < K; j++) s2.push(this.#deriveUniformLeqEta(seedB, j + L));
+      const s1Hat = s1.map((s) => p.NTT.encode(s.slice()));
+      const s2Hat = s2.map((s) => p.NTT.encode(s.slice()));
+
+      shares.set(b, { s1, s2, s1Hat, s2Hat });
+      cleanBytes(seedB);
+    }
+
+    // Phase 3: For bitmasks where this party is generator, compute w^b and split
+    const privateToAll = new Map<number, DKGPhase3Private>();
+    const ownMaskPieces = new Map<number, Int32Array[]>();
+
+    for (const b of bitmasks) {
+      if (generatorAssignment.get(b) !== partyId) continue;
+
+      const share = shares.get(b);
+      if (!share) throw new Error(`Party ${partyId} is generator for bitmask ${b} but doesn't hold it`);
+
+      // w^b = InvNTT(A * s1Hat^b) + s2^b, normalized to [0, Q)
+      const wb: Int32Array[] = [];
+      for (let i = 0; i < K; i++) {
+        const wi = p.newPoly(N);
+        for (let j = 0; j < L; j++) {
+          p.polyAdd(wi, p.MultiplyNTTs(A[i][j], share.s1Hat[j]));
+        }
+        p.NTT.decode(wi);
+        p.polyAdd(wi, share.s2[i]);
+        for (let c = 0; c < N; c++) wi[c] = ((wi[c] % Q) + Q) % Q;
+        wb.push(wi);
+      }
+
+      // Split w^b into N additive masks (residual at gen(b) = partyId)
+      const masks = splitVectorK(wb, params.N, partyId);
+
+      // Distribute masks
+      for (let j = 0; j < params.N; j++) {
+        if (j === partyId) {
+          ownMaskPieces.set(b, masks[j]);
+          continue;
+        }
+        let msg = privateToAll.get(j);
+        if (!msg) {
+          msg = { fromGeneratorId: partyId, maskPieces: new Map<number, Int32Array[]>() };
+          privateToAll.set(j, msg);
+        }
+        (msg.maskPieces as Map<number, Int32Array[]>).set(b, masks[j]);
+      }
+    }
+
+    return { shares, generatorAssignment, rho, privateToAll, ownMaskPieces };
+  }
+
+  /**
+   * Phase 4: Aggregate received mask pieces and broadcast R_j.
+   *
+   * R_j = sum over all bitmasks b of r_{b,j} (mod q)
+   */
+  dkgPhase4(
+    partyId: number,
+    bitmasks: readonly number[],
+    generatorAssignment: ReadonlyMap<number, number>,
+    receivedMasks: readonly DKGPhase3Private[],
+    ownMaskPieces: ReadonlyMap<number, readonly Int32Array[]>
+  ): DKGPhase4Broadcast {
+    const p = this.#primitives;
+    const { K } = p;
+
+    // Build lookup: generator -> their mask pieces for this party
+    const masksByGenerator = new Map<number, ReadonlyMap<number, readonly Int32Array[]>>();
+    for (const rm of receivedMasks) {
+      // Merge from same generator (in case multiple DKGPhase3Private from same generator)
+      const existing = masksByGenerator.get(rm.fromGeneratorId);
+      if (existing) {
+        const merged = new Map(existing);
+        for (const [b, piece] of rm.maskPieces) merged.set(b, piece);
+        masksByGenerator.set(rm.fromGeneratorId, merged);
+      } else {
+        masksByGenerator.set(rm.fromGeneratorId, rm.maskPieces);
+      }
+    }
+
+    // R_j = sum over all b of r_{b,j} (mod q)
+    const aggregate: Int32Array[] = [];
+    for (let k = 0; k < K; k++) aggregate.push(new Int32Array(N));
+
+    for (const b of bitmasks) {
+      const gen = generatorAssignment.get(b)!;
+      let maskPiece: readonly Int32Array[];
+
+      if (gen === partyId) {
+        const own = ownMaskPieces.get(b);
+        if (!own) throw new Error(`Missing own mask piece for bitmask ${b}`);
+        maskPiece = own;
+      } else {
+        const genMasks = masksByGenerator.get(gen);
+        if (!genMasks) throw new Error(`Missing mask pieces from generator ${gen}`);
+        const piece = genMasks.get(b);
+        if (!piece) throw new Error(`Missing mask piece for bitmask ${b} from generator ${gen}`);
+        maskPiece = piece;
+      }
+
+      for (let k = 0; k < K; k++) p.polyAdd(aggregate[k], maskPiece[k]);
+    }
+
+    // Normalize
+    for (let k = 0; k < K; k++) {
+      for (let c = 0; c < N; c++) aggregate[k][c] = p.mod(aggregate[k][c]);
+    }
+
+    return { partyId, aggregate };
+  }
+
+  /**
+   * Finalize: Aggregate all parties' R_j to compute t, derive public key and ThresholdKeyShare.
+   *
+   * t = sum_j R_j (mod q), then Power2Round, encode public key.
+   */
+  dkgFinalize(
+    partyId: number,
+    rho: Uint8Array,
+    allPhase4: readonly DKGPhase4Broadcast[],
+    shares: ReadonlyMap<number, SecretShare>
+  ): DKGResult {
+    const p = this.#primitives;
+    const { K, TR_BYTES } = p;
+    const params = this.params;
+
+    if (allPhase4.length !== params.N) {
+      throw new Error(`Expected ${params.N} Phase 4 broadcasts, got ${allPhase4.length}`);
+    }
+
+    // t = sum_j R_j (mod q)
+    const t: Int32Array[] = [];
+    for (let k = 0; k < K; k++) t.push(new Int32Array(N));
+
+    for (const ph4 of allPhase4) {
+      for (let k = 0; k < K; k++) p.polyAdd(t[k], ph4.aggregate[k]);
+    }
+
+    for (let k = 0; k < K; k++) {
+      for (let c = 0; c < N; c++) t[k][c] = p.mod(t[k][c]);
+    }
+
+    // Power2Round(t) -> (t0, t1)
+    const t1: Int32Array[] = [];
+    for (let k = 0; k < K; k++) {
+      const { r1 } = p.polyPowerRound(t[k]);
+      t1.push(r1);
+    }
+
+    // Encode public key
+    const publicKey = p.publicCoder.encode([rho, t1]);
+
+    // tr = H(pk)
+    const tr = shake256(publicKey, { dkLen: TR_BYTES });
+
+    const share: ThresholdKeyShare = {
+      id: partyId,
+      rho: rho.slice(),
+      key: randomBytes(32),
+      tr,
+      shares: shares as Map<number, SecretShare>,
+    };
+
+    return { publicKey, share };
   }
 
   /** Get the byte size of a packed commitment from round1. */

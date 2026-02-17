@@ -1,4 +1,4 @@
-# Distributed DKG for Threshold ML-DSA
+# Distributed DKG for Threshold ML-DSA — Final Plan v3
 
 ## Goal
 
