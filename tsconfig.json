@@ -1,7 +1,10 @@
 {
   "extends": "@paulmillr/jsbt/tsconfig.json",
   "compilerOptions": {
-    "outDir": "."
+    "outDir": ".",
+    "noImplicitOverride": true,
+    "noPropertyAccessFromIndexSignature": true,
+    "isolatedModules": true
   },
   "include": [
     "src"
