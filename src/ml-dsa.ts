@@ -11,7 +11,7 @@
 import { abool } from '@noble/curves/utils.js';
 import { shake256 } from '@noble/hashes/sha3.js';
 import type { CHash } from '@noble/hashes/utils.js';
-import { type XOF, XOF128, XOF256 } from './_crystals.ts';
+import { XOF128, XOF256 } from './_crystals.ts';
 import {
   createMLDSAPrimitives,
   type MLDSAPrimitives,
@@ -20,11 +20,9 @@ import {
   GAMMA2_1,
   GAMMA2_2,
   N,
-  Q,
 } from './ml-dsa-primitives.ts';
 import {
   abytes,
-  type BytesCoderLen,
   checkHash,
   cleanBytes,
   type CryptoKeys,
@@ -88,8 +86,6 @@ function getDilithium(opts: DilithiumOpts) {
   const { K, L, GAMMA1, GAMMA2, BETA, OMEGA } = p;
   const { CRH_BYTES, TR_BYTES, C_TILDE_BYTES, XOF128, XOF256 } = p;
   const {
-    mod,
-    smod,
     newPoly,
     NTT,
     polyAdd,

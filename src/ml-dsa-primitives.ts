@@ -5,9 +5,8 @@
  */
 /*! noble-post-quantum - MIT License (c) 2024 Paul Miller (paulmillr.com) */
 import { shake256 } from '@noble/hashes/sha3.js';
-import { genCrystals, type XOF, XOF128, XOF256 } from './_crystals.ts';
+import { genCrystals, type XOF } from './_crystals.ts';
 import {
-  type BytesCoder,
   type BytesCoderLen,
   cleanBytes,
   splitCoder,
@@ -23,15 +22,15 @@ const ROOT_OF_UNITY = 1753;
 const F = 8347681;
 export const D = 13;
 // Dilithium is kinda parametrized over GAMMA2, but everything will break with any other value.
-export const GAMMA2_1 = Math.floor((Q - 1) / 88) | 0;
-export const GAMMA2_2 = Math.floor((Q - 1) / 32) | 0;
+export const GAMMA2_1: number = Math.floor((Q - 1) / 88) | 0;
+export const GAMMA2_2: number = Math.floor((Q - 1) / 32) | 0;
 
 // ==================== Core NTT/Ring ====================
 // NOTE: there is a lot cases where negative numbers used (with smod instead of mod).
 type Poly = Int32Array;
-export const newPoly = (n: number): Int32Array => new Int32Array(n);
+const newPoly = (n: number): Int32Array => new Int32Array(n);
 
-export const { mod, smod, NTT, bitsCoder } = genCrystals({
+const { mod, smod, NTT, bitsCoder } = genCrystals({
   N,
   Q,
   F,
@@ -42,27 +41,27 @@ export const { mod, smod, NTT, bitsCoder } = genCrystals({
 });
 
 // ==================== Ring Arithmetic ====================
-export const polyAdd = (a: Poly, b: Poly) => {
+const polyAdd = (a: Poly, b: Poly): Poly => {
   for (let i = 0; i < a.length; i++) a[i] = mod(a[i] + b[i]);
   return a;
 };
-export const polySub = (a: Poly, b: Poly): Poly => {
+const polySub = (a: Poly, b: Poly): Poly => {
   for (let i = 0; i < a.length; i++) a[i] = mod(a[i] - b[i]);
   return a;
 };
 
-export const polyShiftl = (p: Poly): Poly => {
+const polyShiftl = (p: Poly): Poly => {
   for (let i = 0; i < N; i++) p[i] <<= D;
   return p;
 };
 
-export const polyChknorm = (p: Poly, B: number): boolean => {
+const polyChknorm = (p: Poly, B: number): boolean => {
   // Not very sure about this, but FIPS204 doesn't provide any function for that :(
   for (let i = 0; i < N; i++) if (Math.abs(smod(p[i])) >= B) return true;
   return false;
 };
 
-export const MultiplyNTTs = (a: Poly, b: Poly): Poly => {
+const MultiplyNTTs = (a: Poly, b: Poly): Poly => {
   // NOTE: we don't use montgomery reduction in code, since it requires 64 bit ints,
   // which is not available in JS. mod(a[i] * b[i]) is ok, since Q is 23 bit,
   // which means a[i] * b[i] is 46 bit, which is safe to use in JS. (number is 53 bits).
@@ -73,10 +72,10 @@ export const MultiplyNTTs = (a: Poly, b: Poly): Poly => {
 };
 
 // ==================== Sampling ====================
-export type XofGet = ReturnType<ReturnType<XOF>['get']>;
+type XofGet = ReturnType<ReturnType<XOF>['get']>;
 
 // Return poly in NTT representation
-export function RejNTTPoly(xof: XofGet) {
+function RejNTTPoly(xof: XofGet): Int32Array {
   // Samples a polynomial ∈ Tq.
   const r = newPoly(N);
   // NOTE: we can represent 3xu24 as 4xu32, but it doesn't improve perf :(
@@ -95,7 +94,7 @@ export function RejNTTPoly(xof: XofGet) {
 const id = <T>(n: T): T => n;
 type IdNum = (n: number) => number;
 
-export const polyCoder = (d: number, compress: IdNum = id, verify: IdNum = id) =>
+const polyCoder = (d: number, compress: IdNum = id, verify: IdNum = id) =>
   bitsCoder(d, {
     encode: (i: number) => compress(verify(i)),
     decode: (i: number) => verify(compress(i)),
@@ -117,7 +116,72 @@ export type PrimitivesOpts = {
   XOF256: XOF;
 };
 
-export function createMLDSAPrimitives(opts: PrimitivesOpts) {
+/** All ML-DSA primitives returned by createMLDSAPrimitives. */
+export interface MLDSAPrimitives {
+  // Constants
+  readonly K: number;
+  readonly L: number;
+  readonly N: number;
+  readonly Q: number;
+  readonly D: number;
+  readonly GAMMA1: number;
+  readonly GAMMA2: number;
+  readonly TAU: number;
+  readonly ETA: number;
+  readonly OMEGA: number;
+  readonly BETA: number;
+  readonly C_TILDE_BYTES: number;
+  readonly CRH_BYTES: number;
+  readonly TR_BYTES: number;
+  readonly GAMMA2_1: number;
+  readonly GAMMA2_2: number;
+  // Ring arithmetic
+  readonly mod: (a: number, modulo?: number) => number;
+  readonly smod: (a: number, modulo?: number) => number;
+  readonly newPoly: (n: number) => Int32Array;
+  readonly polyAdd: (a: Int32Array, b: Int32Array) => Int32Array;
+  readonly polySub: (a: Int32Array, b: Int32Array) => Int32Array;
+  readonly polyShiftl: (p: Int32Array) => Int32Array;
+  readonly polyChknorm: (p: Int32Array, B: number) => boolean;
+  readonly MultiplyNTTs: (a: Int32Array, b: Int32Array) => Int32Array;
+  readonly NTT: {
+    readonly encode: (r: Int32Array) => Int32Array;
+    readonly decode: (r: Int32Array) => Int32Array;
+  };
+  readonly RejNTTPoly: (xof: () => Uint8Array) => Int32Array;
+  readonly XOF128: XOF;
+  readonly XOF256: XOF;
+  readonly cleanBytes: typeof cleanBytes;
+  // Decomposition
+  readonly decompose: (r: number) => { r1: number; r0: number };
+  readonly HighBits: (r: number) => number;
+  readonly LowBits: (r: number) => number;
+  readonly MakeHint: (z: number, r: number) => number;
+  readonly UseHint: (h: number, r: number) => number;
+  readonly Power2Round: (r: number) => { r1: number; r0: number };
+  // Poly-level helpers
+  readonly polyPowerRound: (p: Int32Array) => { r0: Int32Array; r1: Int32Array };
+  readonly polyUseHint: (u: Int32Array, h: Int32Array) => Int32Array;
+  readonly polyMakeHint: (a: Int32Array, b: Int32Array) => { v: Int32Array; cnt: number };
+  // Sampling
+  readonly RejBoundedPoly: (xof: () => Uint8Array) => Int32Array;
+  readonly SampleInBall: (seed: Uint8Array) => Int32Array;
+  // Coders
+  readonly ETACoder: BytesCoderLen<Int32Array>;
+  readonly T0Coder: BytesCoderLen<Int32Array>;
+  readonly T1Coder: BytesCoderLen<Int32Array>;
+  readonly ZCoder: BytesCoderLen<Int32Array>;
+  readonly W1Coder: BytesCoderLen<Int32Array>;
+  readonly W1Vec: BytesCoderLen<Int32Array[]>;
+  readonly hintCoder: BytesCoderLen<Int32Array[] | false>;
+  readonly sigCoder: BytesCoderLen<[Uint8Array, Int32Array[], Int32Array[] | false]>;
+  readonly publicCoder: BytesCoderLen<[Uint8Array, Int32Array[]]>;
+  readonly secretCoder: BytesCoderLen<
+    [Uint8Array, Uint8Array, Uint8Array, Int32Array[], Int32Array[], Int32Array[]]
+  >;
+}
+
+export function createMLDSAPrimitives(opts: PrimitivesOpts): MLDSAPrimitives {
   const { K, L, GAMMA1, GAMMA2, TAU, ETA, OMEGA } = opts;
   const { CRH_BYTES, TR_BYTES, C_TILDE_BYTES, XOF128: _XOF128, XOF256: _XOF256 } = opts;
 
@@ -288,62 +352,60 @@ export function createMLDSAPrimitives(opts: PrimitivesOpts) {
 
   return {
     // Constants
-    K,
-    L,
-    N,
-    Q,
-    D,
-    GAMMA1,
-    GAMMA2,
-    TAU,
-    ETA,
-    OMEGA,
-    BETA,
-    C_TILDE_BYTES,
-    CRH_BYTES,
-    TR_BYTES,
-    GAMMA2_1,
-    GAMMA2_2,
+    K: K,
+    L: L,
+    N: N,
+    Q: Q,
+    D: D,
+    GAMMA1: GAMMA1,
+    GAMMA2: GAMMA2,
+    TAU: TAU,
+    ETA: ETA,
+    OMEGA: OMEGA,
+    BETA: BETA,
+    C_TILDE_BYTES: C_TILDE_BYTES,
+    CRH_BYTES: CRH_BYTES,
+    TR_BYTES: TR_BYTES,
+    GAMMA2_1: GAMMA2_1,
+    GAMMA2_2: GAMMA2_2,
     // Ring arithmetic
-    mod,
-    smod,
-    newPoly,
-    polyAdd,
-    polySub,
-    polyShiftl,
-    polyChknorm,
-    MultiplyNTTs,
-    NTT,
-    RejNTTPoly,
+    mod: mod,
+    smod: smod,
+    newPoly: newPoly,
+    polyAdd: polyAdd,
+    polySub: polySub,
+    polyShiftl: polyShiftl,
+    polyChknorm: polyChknorm,
+    MultiplyNTTs: MultiplyNTTs,
+    NTT: NTT,
+    RejNTTPoly: RejNTTPoly,
     XOF128: _XOF128,
     XOF256: _XOF256,
-    cleanBytes,
+    cleanBytes: cleanBytes,
     // Decomposition
-    decompose,
-    HighBits,
-    LowBits,
-    MakeHint,
-    UseHint,
-    Power2Round,
+    decompose: decompose,
+    HighBits: HighBits,
+    LowBits: LowBits,
+    MakeHint: MakeHint,
+    UseHint: UseHint,
+    Power2Round: Power2Round,
     // Poly-level helpers
-    polyPowerRound,
-    polyUseHint,
-    polyMakeHint,
+    polyPowerRound: polyPowerRound,
+    polyUseHint: polyUseHint,
+    polyMakeHint: polyMakeHint,
     // Sampling
-    RejBoundedPoly,
-    SampleInBall,
+    RejBoundedPoly: RejBoundedPoly,
+    SampleInBall: SampleInBall,
     // Coders
-    ETACoder,
-    T0Coder,
-    T1Coder,
-    ZCoder,
-    W1Coder,
-    W1Vec,
-    hintCoder,
-    sigCoder,
-    publicCoder,
-    secretCoder,
+    ETACoder: ETACoder,
+    T0Coder: T0Coder,
+    T1Coder: T1Coder,
+    ZCoder: ZCoder,
+    W1Coder: W1Coder,
+    W1Vec: W1Vec,
+    hintCoder: hintCoder,
+    sigCoder: sigCoder,
+    publicCoder: publicCoder,
+    secretCoder: secretCoder,
   };
 }
-
-export type MLDSAPrimitives = ReturnType<typeof createMLDSAPrimitives>;
